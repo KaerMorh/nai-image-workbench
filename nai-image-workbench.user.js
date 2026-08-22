@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         NovelAI Toolbox - Queue & Prompt Batch
+// @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.1
-// @description  Persistent single-flight queue, prompt replacement batches, and History save indicators for NovelAI Image Generation.
+// @version      0.6.2
+// @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/image*
 // @run-at       document-start
@@ -14,18 +14,18 @@
 (() => {
   'use strict';
 
-  if (window.__NAI_TOOLBOX_QUEUE_LOADED__) return;
-  window.__NAI_TOOLBOX_QUEUE_LOADED__ = true;
+  if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
+  window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.1';
-  const DB_NAME = 'nai-toolbox-generation-queue';
+  const SCRIPT_VERSION = '0.6.2';
+  const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
   const META_STORE = 'meta';
   const BLOB_STORE = 'blobs';
-  const CHANNEL_NAME = 'nai-toolbox-generation-queue-v1';
-  const EXECUTION_LOCK = 'nai-toolbox-generation-execution-v1';
-  const BATCH_CONTROLLER_LOCK = 'nai-toolbox-batch-controller-v1';
+  const CHANNEL_NAME = 'nai-image-workbench-channel-v1';
+  const EXECUTION_LOCK = 'nai-image-workbench-execution-v1';
+  const BATCH_CONTROLLER_LOCK = 'nai-image-workbench-batch-controller-v1';
   const MAX_FINISHED = 100;
   const MAX_BATCH_ITEMS = 500;
   const GENERATION_TIMEOUT_MS = 120_000;
@@ -35,7 +35,7 @@
   const QUEUE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
   const GENERATION_ENDPOINT_RE = /https:\/\/image\.novelai\.net\/ai\/generate-image(?:-stream)?(?:\?|$)/i;
   const LARGE_BINARY_MIN_LENGTH = 16_384;
-  const BLOB_REF_KEY = '$naiToolboxBlobRef';
+  const BLOB_REF_KEY = '$naiImageWorkbenchBlobRef';
   const TAB_ID = crypto.randomUUID();
 
   const nativeFetch = window.fetch.bind(window);
@@ -910,11 +910,11 @@
   }
 
   function ensureHistoryIndicatorStyle() {
-    if (document.getElementById('nai-toolbox-history-save-style')) return;
+    if (document.getElementById('nai-image-workbench-history-save-style')) return;
     const style = document.createElement('style');
-    style.id = 'nai-toolbox-history-save-style';
+    style.id = 'nai-image-workbench-history-save-style';
     style.textContent = `
-      [data-nai-toolbox-history-saved]::after {
+      [data-nai-image-workbench-history-saved]::after {
         content: "";
         position: absolute;
         right: 5px;
@@ -927,15 +927,15 @@
         box-shadow: 0 1px 4px rgba(0, 0, 0, .55);
         pointer-events: none !important;
       }
-      [data-nai-toolbox-history-saved="true"]::after { background: #39d98a; }
-      [data-nai-toolbox-history-saved="false"]::after { background: #ff5d73; }
+      [data-nai-image-workbench-history-saved="true"]::after { background: #39d98a; }
+      [data-nai-image-workbench-history-saved="false"]::after { background: #ff5d73; }
     `;
     (document.head || document.documentElement).append(style);
   }
 
   function clearHistorySaveIndicators() {
-    document.querySelectorAll('[data-nai-toolbox-history-saved]').forEach((element) => {
-      element.removeAttribute('data-nai-toolbox-history-saved');
+    document.querySelectorAll('[data-nai-image-workbench-history-saved]').forEach((element) => {
+      element.removeAttribute('data-nai-image-workbench-history-saved');
     });
   }
 
@@ -984,13 +984,13 @@
       if (saved !== null) {
         const nextValue = String(saved);
         markedTargets.add(target);
-        if (target.getAttribute('data-nai-toolbox-history-saved') !== nextValue) {
-          target.setAttribute('data-nai-toolbox-history-saved', nextValue);
+        if (target.getAttribute('data-nai-image-workbench-history-saved') !== nextValue) {
+          target.setAttribute('data-nai-image-workbench-history-saved', nextValue);
         }
       }
     }
-    root.querySelectorAll('[data-nai-toolbox-history-saved]').forEach((element) => {
-      if (!markedTargets.has(element)) element.removeAttribute('data-nai-toolbox-history-saved');
+    root.querySelectorAll('[data-nai-image-workbench-history-saved]').forEach((element) => {
+      if (!markedTargets.has(element)) element.removeAttribute('data-nai-image-workbench-history-saved');
     });
   }
 
@@ -1153,7 +1153,7 @@
         ? preparedCallback.selected(get, set)
         : preparedCallback.selected(get, set, false);
       if (returned && typeof returned.catch === 'function') {
-        returned.catch((error) => console.error('[NAI Toolbox] Generation plan capture failed:', error));
+        returned.catch((error) => console.error('[NAI Image Workbench] Generation plan capture failed:', error));
       }
       await Promise.race([
         capturedPromise,
@@ -1701,7 +1701,7 @@
         args[0] = { ...(args[0] || {}), prompt: job.batchPrompt };
         const returned = batchRuntimePlan.invocation.originalMethod.apply(batchRuntimePlan.invocation.thisArg, args);
         if (returned && typeof returned.catch === 'function') {
-          returned.catch((error) => console.error('[NAI Toolbox] Batch carrier failed:', error));
+          returned.catch((error) => console.error('[NAI Image Workbench] Batch carrier failed:', error));
         }
         return;
       } catch (error) {
@@ -1862,7 +1862,7 @@
         await executeRuntimeJob(freshJob, runtime);
       });
     } catch (error) {
-      console.error('[NAI Toolbox] Scheduler error:', error);
+      console.error('[NAI Image Workbench] Scheduler error:', error);
       notify(`队列调度失败：${error.message || error}`, 'error');
       await saveState({ paused: true });
     } finally {
@@ -1937,7 +1937,7 @@
     overlay.textContent = shouldCaptureGenerateClick() ? '加入队列' : '';
     overlay.title = cachedState.paused
       ? '队列已暂停；当前生成结束前不能直接生成'
-      : '点击会把当前配置加入 NovelAI 工具盒队列';
+      : '点击会把当前配置加入 NAI Image Workbench 队列';
   }
 
   async function waitForNovelAIIdle(busyAccess, timeoutMs = GENERATION_TIMEOUT_MS) {
@@ -1989,7 +1989,7 @@
           pending.invocation.activate();
           const returned = liveApi.originalMethod.apply(liveApi.api, pending.invocation.args);
           if (returned && typeof returned.catch === 'function') {
-            returned.catch((error) => console.error('[NAI Toolbox] Deferred generation capture failed:', error));
+            returned.catch((error) => console.error('[NAI Image Workbench] Deferred generation capture failed:', error));
           }
         } catch (error) {
           const index = captureSessions.indexOf(session);
@@ -2117,7 +2117,7 @@
       args[0] = { ...(args[0] || {}), prompt };
       const returned = plan.invocation.originalMethod.apply(plan.invocation.thisArg, args);
       if (returned && typeof returned.catch === 'function') {
-        returned.catch((error) => console.error('[NAI Toolbox] Batch generation dispatch failed:', error));
+        returned.catch((error) => console.error('[NAI Image Workbench] Batch generation dispatch failed:', error));
       }
       if (!(await waitForCaptureSession(session))) throw new Error('没有捕获到批量生成请求。');
     } catch (error) {
@@ -2377,7 +2377,7 @@
 
   function notify(message, type = 'info', action = null) {
     if (!shadow) {
-      console[type === 'error' ? 'error' : 'log'](`[NAI Toolbox] ${message}`);
+      console[type === 'error' ? 'error' : 'log'](`[NAI Image Workbench] ${message}`);
       return;
     }
     if (cachedState.settings.toastPosition === 'off') return;
@@ -2754,9 +2754,9 @@
   }
 
   function buildUi() {
-    if (document.getElementById('nai-toolbox-queue-host')) return;
+    if (document.getElementById('nai-image-workbench-host')) return;
     uiHost = document.createElement('div');
-    uiHost.id = 'nai-toolbox-queue-host';
+    uiHost.id = 'nai-image-workbench-host';
     shadow = uiHost.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
@@ -2833,9 +2833,9 @@
         .generate-hitbox[hidden] { display: none; }
         @media (max-width: 700px) { .panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 64vh; } }
       </style>
-      <section class="panel" aria-label="NovelAI 工具盒队列">
+      <section class="panel" aria-label="NAI Image Workbench 队列">
         <header class="header">
-          <div class="title">NovelAI 工具盒</div>
+          <div class="title">NAI Image Workbench</div>
           <button class="pause primary" type="button">暂停</button>
           <button class="settings" type="button">设置</button>
           <button class="collapse" type="button" aria-label="折叠">—</button>
@@ -3201,13 +3201,13 @@
       void markTabHeartbeat(true);
     });
 
-    notify(`队列工具已就绪 · v${SCRIPT_VERSION}`, 'success');
+    notify(`NAI Image Workbench 已就绪 · v${SCRIPT_VERSION}`, 'success');
     kickScheduler();
     scheduleBatchController();
   }
 
   const start = () => void initialize().catch((error) => {
-    console.error('[NAI Toolbox] Initialization failed:', error);
+    console.error('[NAI Image Workbench] Initialization failed:', error);
   });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();

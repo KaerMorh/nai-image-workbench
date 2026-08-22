@@ -2,7 +2,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const source = await readFile(new URL('../novelai-toolbox.user.js', import.meta.url), 'utf8');
+const source = await readFile(new URL('../nai-image-workbench.user.js', import.meta.url), 'utf8');
+const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+
+test('keeps the public name and release version aligned', () => {
+  assert.match(source, /@name\s+NAI Image Workbench/);
+  assert.match(source, new RegExp(`@version\\s+${packageJson.version.replaceAll('.', '\\.')}`));
+  assert.match(source, new RegExp(`SCRIPT_VERSION = '${packageJson.version.replaceAll('.', '\\.')}'`));
+  assert.match(readme, /^# NAI Image Workbench$/m);
+});
 
 test('targets only the NovelAI image page and runs in the main world', () => {
   assert.match(source, /@match\s+https:\/\/novelai\.net\/image\*/);
@@ -70,7 +79,7 @@ test('allows every toast to be dismissed directly', () => {
   assert.match(source, /event\.target\.closest\('button'\)/);
 });
 
-test('supports bottom-right, top-right, or disabled toolbox notifications', () => {
+test('supports bottom-right, top-right, or disabled workbench notifications', () => {
   assert.match(source, /toastPosition: 'bottom-right'/);
   assert.match(source, /\['bottom-right', 'top-right', 'off'\]/);
   assert.match(source, /data-position="top-right"/);
@@ -88,10 +97,10 @@ test('marks History images from NovelAI download state without changing History'
   assert.match(source, /localGenerationRunning \? false : visualSaved/);
   assert.match(source, /downloadButton\.disabled \|\| props\?\.disabled/);
   assert.match(source, /Array\.isArray\(value\.downloaded\)/);
-  assert.match(source, /data-nai-toolbox-history-saved/);
+  assert.match(source, /data-nai-image-workbench-history-saved/);
   assert.match(source, /#39d98a/);
   assert.match(source, /#ff5d73/);
-  assert.match(source, /\[data-nai-toolbox-history-saved\]::after/);
+  assert.match(source, /\[data-nai-image-workbench-history-saved\]::after/);
   assert.match(source, /right: 5px/);
   assert.match(source, /bottom: 5px/);
   assert.match(source, /pointer-events: none !important/);

@@ -1,8 +1,8 @@
 {
-  "name": "novelai-toolbox-generation-queue",
-  "version": "0.6.1",
+  "name": "nai-image-workbench",
+  "version": "0.6.2",
   "private": true,
   "scripts": {
-    "test": "node --check novelai-toolbox.user.js && node --test tests/static.test.mjs"
+    "test": "node --check nai-image-workbench.user.js && node --test tests/static.test.mjs"
   }
 }
