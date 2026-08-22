@@ -51,6 +51,7 @@ test('matches the NovelAI generate button and restores NovelAI disabled state fo
   assert.match(source, /addEventListener\('click', onGenerateOverlayClick\)/);
   assert.match(source, /background: rgb\(245, 243, 194\) !important/);
   assert.match(source, /class="generate-hitbox-label"/);
+  assert.match(source, /\.generate-hitbox-label \{ color: rgb\(112, 119, 194\); \}/);
   assert.match(source, /class="generate-hitbox-cost"/);
   assert.match(source, /label\.textContent = queueMode \? '加入队列'/);
   assert.match(source, /capturedPrice: extractCapturedPrice\(target\.innerText\)/);
@@ -86,7 +87,7 @@ test('captures current React generation parameters without sending in parallel',
   assert.match(source, /pendingSnapshotCaptures/);
   assert.match(source, /activeInvocation\.originalMethod\.apply\(activeInvocation\.thisArg, invocationArgs\)/);
   assert.match(source, /activation: activeInvocation\.activate/);
-  assert.match(source, /const forceNewSeed = readNativeFixedSeed\(\) === null/);
+  assert.match(source, /const fixedSeed = readNativeFixedSeed\(\);\s*const forceNewSeed = fixedSeed === null/);
   assert.match(source, /captureGenerationInvocation\(preparedCallback, busyRelease, \{ force: forceNewSeed \}\)/);
   assert.match(source, /function createUnfixedImageSeed\(\)/);
   assert.match(source, /if \(forceNewSeed\) \{\s*const invocationOptions = invocationArgs\[0\] \|\| \{};/);
@@ -105,17 +106,51 @@ test('parses multipart request JSON and preserves NovelAI request seeds across r
   assert.match(source, /headers: job\.requestHeaders \|\| prepared\.headers/);
 });
 
-test('waits for the active generation, then queues only a NovelAI-produced request', () => {
+test('waits for generation and rejects a fixed-seed duplicate against only the active predecessor', () => {
   assert.match(source, /session\.type === 'enqueue'/);
-  assert.match(source, /while \(cachedBusy && now\(\) < validationDeadline\)/);
+  assert.match(source, /while \(cachedBusy\)/);
   assert.match(source, /let activeInvocation = invocation/);
   assert.match(source, /activation: activeInvocation\.activate/);
+  assert.match(source, /comparisonFingerprint: pending\.comparisonFingerprint/);
   assert.match(source, /validationPassed = await waitForCaptureSession\(session, 1_500\)/);
-  assert.match(source, /参数与上次生成完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列/);
+  assert.match(source, /参数与上一个任务完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列/);
+  assert.match(source, /const fixedSeed = readNativeFixedSeed\(\)/);
+  assert.match(source, /if \(fixedSeed !== null\)/);
+  assert.match(source, /immediateDuplicateBaselineFingerprint/);
+  assert.match(source, /activePredecessors\.at\(-1\)\.comparisonFingerprint/);
+  assert.match(source, /cachedBusy\?\.comparisonFingerprint/);
+  assert.match(source, /officialGenerationFingerprint\(invocationArgs\)/);
+  assert.match(source, /Object\.keys\(value\)\.sort\(\)/);
   assert.match(source, /runtime\.activation\(\)/);
   assert.match(source, /status\.textContent = '等待生成'/);
   assert.doesNotMatch(source, /等待 NovelAI 校验/);
+  assert.doesNotMatch(source, /validationDeadline/);
   assert.doesNotMatch(source, /drainSnapshotCaptures/);
+});
+
+test('records official duplicate validation as completed and continues the queue', () => {
+  assert.match(source, /DUPLICATE_GENERATION_MESSAGE = '设置与 Seed 与之前的任务完全重复'/);
+  assert.match(source, /recordDuplicatePendingAsFinished\(pending\)/);
+  assert.match(source, /status: 'duplicate'/);
+  assert.match(source, /NOVELAI_DUPLICATE_NOTICE_RE/);
+  assert.match(source, /session\.duplicateValidationSeen = true/);
+  assert.match(source, /session\.type === 'carrier' && session\.duplicateValidationSeen/);
+  assert.match(source, /if \(duplicateValidationSeen\)/);
+  assert.match(source, /finishJob\(session\.jobId, 'duplicate'.*pauseOnFailure: false/);
+  assert.match(source, /!\['success', 'duplicate'\]\.includes\(status\)/);
+  assert.match(source, /\['success', 'failed', 'unknown', 'duplicate'\]/);
+  assert.match(source, /kickScheduler\(\)/);
+});
+
+test('captures a fixed-seed direct generation fingerprint while dispatching exactly once', () => {
+  assert.match(source, /rememberDirectGenerationFingerprint/);
+  assert.match(source, /event\.isTrusted/);
+  assert.match(source, /event\.stopImmediatePropagation\(\)/);
+  assert.match(source, /invocation\.originalMethod\.apply\(invocation\.thisArg, invocation\.args\)/);
+  assert.match(source, /replayingDirectGenerateClick/);
+  assert.match(source, /pendingDirectComparisonCapture/);
+  assert.match(source, /activeDirectComparisonFingerprintPromise/);
+  assert.match(source, /comparisonFingerprint/);
 });
 
 test('allows every toast to be dismissed directly', () => {

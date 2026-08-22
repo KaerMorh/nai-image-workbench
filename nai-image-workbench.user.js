@@ -36,6 +36,9 @@
   const GENERATION_ENDPOINT_RE = /https:\/\/image\.novelai\.net\/ai\/generate-image(?:-stream)?(?:\?|$)/i;
   const LARGE_BINARY_MIN_LENGTH = 16_384;
   const BLOB_REF_KEY = '$naiImageWorkbenchBlobRef';
+  const DUPLICATE_GENERATION_MESSAGE = '设置与 Seed 与之前的任务完全重复';
+  const DUPLICATE_ENQUEUE_MESSAGE = '参数与上一个任务完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列。';
+  const NOVELAI_DUPLICATE_NOTICE_RE = /Identical parameters to last generation\. You may want to change or remove the image seed\.?/i;
   const TAB_ID = crypto.randomUUID();
 
   const nativeFetch = window.fetch.bind(window);
@@ -63,6 +66,9 @@
   let cachedBusy = null;
   let idleJotaiBooleanAtoms = [];
   let snapshotProbeChain = Promise.resolve();
+  let pendingDirectComparisonCapture = null;
+  let activeDirectComparisonFingerprintPromise = null;
+  let replayingDirectGenerateClick = false;
   let captureSequence = 0;
   const captureSessions = [];
   const pendingSnapshotCaptures = [];
@@ -467,6 +473,48 @@
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
+  async function sha256Bytes(value) {
+    const digest = await crypto.subtle.digest('SHA-256', value);
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function canonicalizeOfficialGenerationValue(value, seen = new WeakSet()) {
+    if (value === null) return ['null'];
+    if (value === undefined) return ['undefined'];
+    const type = typeof value;
+    if (type === 'string' || type === 'boolean') return [type, value];
+    if (type === 'number') return ['number', Number.isNaN(value) ? 'NaN' : Object.is(value, -0) ? '-0' : String(value)];
+    if (type === 'bigint') return ['bigint', String(value)];
+    if (type === 'function' || type === 'symbol') return [type, String(value)];
+    if (value instanceof Blob) {
+      return ['blob', value.type, value.size, await sha256Bytes(await value.arrayBuffer())];
+    }
+    if (value instanceof ArrayBuffer) return ['array-buffer', await sha256Bytes(value)];
+    if (ArrayBuffer.isView(value)) {
+      const bytes = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      return ['typed-array', value.constructor.name, await sha256Bytes(bytes)];
+    }
+    if (value instanceof Date) return ['date', value.toISOString()];
+    if (seen.has(value)) return ['circular'];
+    seen.add(value);
+    if (Array.isArray(value)) {
+      const items = [];
+      for (const child of value) items.push(await canonicalizeOfficialGenerationValue(child, seen));
+      seen.delete(value);
+      return ['array', items];
+    }
+    const entries = [];
+    for (const key of Object.keys(value).sort()) {
+      entries.push([key, await canonicalizeOfficialGenerationValue(value[key], seen)]);
+    }
+    seen.delete(value);
+    return ['object', value.constructor?.name || 'Object', entries];
+  }
+
+  async function officialGenerationFingerprint(invocationArgs) {
+    return sha256(JSON.stringify(await canonicalizeOfficialGenerationValue(invocationArgs)));
+  }
+
   function pathLooksLikeImage(path) {
     return /(?:^|\.)(?:image|mask|reference_image|reference_images|reference_image_multiple|director_reference_images|character_reference|init_image)(?:\.|\[|$)/i.test(path);
   }
@@ -817,8 +865,8 @@
     if (busy?.tabId && busy.tabId !== TAB_ID) await updateBusy(null);
   }
 
-  async function beginBusy(kind, jobId = null) {
-    const value = { tabId: TAB_ID, kind, jobId, startedAt: now(), heartbeatAt: now() };
+  async function beginBusy(kind, jobId = null, comparisonFingerprint = null) {
+    const value = { tabId: TAB_ID, kind, jobId, comparisonFingerprint, startedAt: now(), heartbeatAt: now() };
     await updateBusy(value);
     if (heartbeatTimer) nativeClearTimeout(heartbeatTimer);
     const beat = async () => {
@@ -1234,6 +1282,52 @@
     }) || buttons[0] || null;
   }
 
+  async function rememberDirectGenerationFingerprint(event) {
+    const button = event.target instanceof Element ? event.target.closest('button.image-gen-generate-button') : null;
+    if (replayingDirectGenerateClick || !event.isTrusted || !button || !cachedState.settings.queueEnabled || cachedState.paused
+      || cachedBusy || currentExecution || captureSessions.length || activeQueueCount() || pendingSnapshotCaptures.length) return;
+    const fixedSeed = readNativeFixedSeed();
+    if (fixedSeed === null) return;
+    rememberIdleJotaiAtoms(button);
+    const busyAccess = temporarilyReleaseNovelAIBusy(button);
+    const preparedCallback = busyAccess ? prepareCurrentGenerationCallback(button, busyAccess) : null;
+    if (!preparedCallback) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    try {
+      const invocation = await (snapshotProbeChain = snapshotProbeChain
+        .catch(() => undefined)
+        .then(() => captureGenerationInvocation(preparedCallback, busyAccess, { force: false })));
+      if (!invocation) throw new Error('无法捕获当前直接生成配置。');
+      pendingDirectComparisonCapture = {
+        createdAt: now(),
+        fingerprintPromise: officialGenerationFingerprint(invocation.args).catch(() => null),
+      };
+      invocation.activate();
+      const returned = invocation.originalMethod.apply(invocation.thisArg, invocation.args);
+      if (returned && typeof returned.catch === 'function') {
+        returned.catch((error) => console.error('[NAI Image Workbench] Direct generation dispatch failed:', error));
+      }
+    } catch (error) {
+      console.error('[NAI Image Workbench] Direct generation comparison capture failed:', error);
+      replayingDirectGenerateClick = true;
+      try {
+        button.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          ctrlKey: Boolean(event.ctrlKey),
+          metaKey: Boolean(event.metaKey),
+          shiftKey: Boolean(event.shiftKey),
+          altKey: Boolean(event.altKey),
+          view: window,
+        }));
+      } finally {
+        replayingDirectGenerateClick = false;
+      }
+    }
+  }
+
   function createCaptureSession(type, details = {}) {
     let resolveCapture;
     const session = {
@@ -1246,13 +1340,35 @@
       ...details,
     };
     captureSessions.push(session);
+    session.validationObserver = new MutationObserver((records) => {
+      for (const record of records) {
+        const changedText = record.type === 'characterData'
+          ? record.target.textContent
+          : Array.from(record.addedNodes, (node) => node.textContent || '').join(' ');
+        if (NOVELAI_DUPLICATE_NOTICE_RE.test(changedText || '')) {
+          session.duplicateValidationSeen = true;
+          break;
+        }
+      }
+    });
+    session.validationObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     session.cleanupTimer = nativeSetTimeout(() => {
+      session.validationObserver.disconnect();
       const index = captureSessions.indexOf(session);
       if (index >= 0) captureSessions.splice(index, 1);
       if (!session.consumed) {
         session.expired = true;
         session.resolveCapture(false);
         if (session.type === 'enqueue') return;
+        if (session.type === 'carrier' && session.duplicateValidationSeen) {
+          void finishJob(session.jobId, 'duplicate', DUPLICATE_GENERATION_MESSAGE, { pauseOnFailure: false })
+            .then(() => {
+              notify('该任务与之前的设置和 Seed 完全重复，已记入完成并继续队列。', 'info');
+              notifyPeers('kick');
+              kickScheduler();
+            });
+          return;
+        }
         if (session.type === 'batch-start' || session.type === 'batch-refresh') {
           void loadState().then((state) => saveState({
             batch: normalizeBatchState({
@@ -1279,6 +1395,7 @@
     session.consumed = true;
     session.resolveCapture(true);
     nativeClearTimeout(session.cleanupTimer);
+    session.validationObserver?.disconnect();
     return session;
   }
 
@@ -1286,6 +1403,7 @@
     const index = captureSessions.indexOf(session);
     if (index >= 0) captureSessions.splice(index, 1);
     nativeClearTimeout(session.cleanupTimer);
+    session.validationObserver?.disconnect();
     if (!session.consumed) session.resolveCapture(false);
   }
 
@@ -1295,6 +1413,7 @@
       const index = captureSessions.indexOf(session);
       if (index >= 0) captureSessions.splice(index, 1);
       nativeClearTimeout(session.cleanupTimer);
+      session.validationObserver?.disconnect();
       notify('无法连接 NovelAI 的生成处理函数，队列已暂停。', 'error');
       void saveState({ paused: true });
       return false;
@@ -1328,6 +1447,7 @@
       const index = captureSessions.indexOf(session);
       if (index >= 0) captureSessions.splice(index, 1);
       nativeClearTimeout(session.cleanupTimer);
+      session.validationObserver?.disconnect();
       notify(`无法读取当前配置：${error.message || error}`, 'error');
       void saveState({ paused: true });
       return false;
@@ -1375,11 +1495,15 @@
       batchVariable: details.batchVariable || null,
       batchValue: details.batchValue ?? null,
       batchPrompt: details.batchPrompt || null,
+      comparisonFingerprint: details.comparisonFingerprint || null,
     };
   }
 
   async function addCapturedJob(prepared, captureSession, deferred) {
-    const job = await buildStoredJobFromPrepared(prepared, { costText: captureSession.costText });
+    const job = await buildStoredJobFromPrepared(prepared, {
+      costText: captureSession.costText,
+      comparisonFingerprint: captureSession.comparisonFingerprint,
+    });
     const fingerprint = await requestFingerprint(prepared);
     runtimeJobs.set(job.id, {
       prepared,
@@ -1474,7 +1598,19 @@
   }
 
   async function trackDirectGeneration(input, init) {
+    const directCapture = pendingDirectComparisonCapture
+      && now() - pendingDirectComparisonCapture.createdAt < 30_000
+      ? pendingDirectComparisonCapture
+      : null;
+    pendingDirectComparisonCapture = null;
+    activeDirectComparisonFingerprintPromise = directCapture?.fingerprintPromise || null;
     await beginBusy('direct');
+    if (activeDirectComparisonFingerprintPromise) {
+      void activeDirectComparisonFingerprintPromise.then((comparisonFingerprint) => {
+        if (!comparisonFingerprint || cachedBusy?.tabId !== TAB_ID || cachedBusy.kind !== 'direct') return;
+        return updateBusy({ ...cachedBusy, comparisonFingerprint });
+      });
+    }
     let response;
     try {
       response = await nativeFetch(input, init);
@@ -1482,12 +1618,14 @@
         const state = await loadState();
         await sleep(state.settings.interJobDelayMs);
         await endBusy();
+        activeDirectComparisonFingerprintPromise = null;
         notifyPeers('kick');
         kickScheduler();
       });
       return response;
     } catch (error) {
       await endBusy();
+      activeDirectComparisonFingerprintPromise = null;
       notifyPeers('kick');
       kickScheduler();
       throw error;
@@ -1609,7 +1747,7 @@
     runtimeJobs.delete(jobId);
     await trimFinishedJobs();
     await handleBatchJobFinished(updated);
-    if (pauseOnFailure && status !== 'success' && !updated?.batchId) await saveState({ paused: true });
+    if (pauseOnFailure && !['success', 'duplicate'].includes(status) && !updated?.batchId) await saveState({ paused: true });
     scheduleRefresh();
     return updated;
   }
@@ -1617,7 +1755,7 @@
   async function trimFinishedJobs() {
     const jobs = await getAllJobs();
     const finished = jobs
-      .filter((job) => ['success', 'failed', 'unknown'].includes(job.status))
+      .filter((job) => ['success', 'failed', 'unknown', 'duplicate'].includes(job.status))
       .sort((a, b) => Number(b.endedAt || 0) - Number(a.endedAt || 0));
     const state = await loadState();
     const maxFinished = state.settings.maxFinished;
@@ -1787,6 +1925,7 @@
         const index = captureSessions.indexOf(session);
         if (index >= 0) captureSessions.splice(index, 1);
         nativeClearTimeout(session.cleanupTimer);
+        session.validationObserver?.disconnect();
         throw error;
       }
     }
@@ -1990,6 +2129,52 @@
     return cachedJobs.filter((job) => ['queued', 'running', 'retry_wait'].includes(job.status)).length;
   }
 
+  async function immediateDuplicateBaselineFingerprint() {
+    cachedJobs = await getAllJobs();
+    const activePredecessors = [
+      ...cachedJobs
+        .filter((job) => ['queued', 'running', 'retry_wait'].includes(job.status))
+        .map((job) => ({ createdAt: job.createdAt, comparisonFingerprint: job.comparisonFingerprint || null })),
+      ...pendingSnapshotCaptures
+        .filter((pending) => !pending.cancelled)
+        .map((pending) => ({ createdAt: pending.createdAt, comparisonFingerprint: pending.comparisonFingerprint || null })),
+    ].sort((left, right) => Number(left.createdAt) - Number(right.createdAt));
+    if (activePredecessors.length) return activePredecessors.at(-1).comparisonFingerprint;
+    await refreshBusyCache();
+    if (cachedBusy?.comparisonFingerprint) return cachedBusy.comparisonFingerprint;
+    if (cachedBusy?.tabId === TAB_ID && cachedBusy.kind === 'direct' && activeDirectComparisonFingerprintPromise) {
+      return activeDirectComparisonFingerprintPromise;
+    }
+    return null;
+  }
+
+  async function recordDuplicatePendingAsFinished(pending) {
+    const timestamp = now();
+    await putJob({
+      id: pending.id,
+      createdAt: pending.createdAt,
+      updatedAt: timestamp,
+      endedAt: timestamp,
+      status: 'duplicate',
+      ownerTabId: null,
+      promptPreview: pending.promptPreview,
+      model: pending.model,
+      width: pending.width,
+      height: pending.height,
+      imageCount: pending.imageCount,
+      imageFlags: pending.imageFlags,
+      capturedPrice: pending.capturedPrice,
+      queueRetry: 0,
+      siteAttempts: 0,
+      retryAt: null,
+      error: DUPLICATE_GENERATION_MESSAGE,
+      source: 'duplicate-validation',
+      comparisonFingerprint: pending.comparisonFingerprint || null,
+      blobRefs: [],
+    });
+    await trimFinishedJobs();
+  }
+
   function shouldCaptureGenerateClick() {
     return cachedState.settings.queueEnabled && !cachedState.paused
       && (Boolean(cachedBusy) || activeQueueCount() > 0 || pendingSnapshotCaptures.length > 0);
@@ -2081,7 +2266,8 @@
       void saveState({ paused: true }).then(scheduleRefresh);
       return;
     }
-    const forceNewSeed = readNativeFixedSeed() === null;
+    const fixedSeed = readNativeFixedSeed();
+    const forceNewSeed = fixedSeed === null;
     const invocation = await (snapshotProbeChain = snapshotProbeChain
       .catch(() => undefined)
       .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed })));
@@ -2091,6 +2277,22 @@
       return;
     }
     const options = invocation.args[0] || {};
+    const invocationArgs = [...invocation.args];
+    if (forceNewSeed) {
+      const invocationOptions = invocationArgs[0] || {};
+      invocationArgs[0] = {
+        ...invocationOptions,
+        params: { ...(invocationOptions.params || {}), seed: createUnfixedImageSeed() },
+      };
+    }
+    const comparisonFingerprint = await officialGenerationFingerprint(invocationArgs);
+    if (fixedSeed !== null) {
+      const predecessorFingerprint = await immediateDuplicateBaselineFingerprint();
+      if (predecessorFingerprint && predecessorFingerprint === comparisonFingerprint) {
+        notify(DUPLICATE_ENQUEUE_MESSAGE, 'info');
+        return;
+      }
+    }
     const pending = {
       id: crypto.randomUUID(),
       createdAt: now(),
@@ -2109,22 +2311,14 @@
         options.referenceImages?.length ? { label: 'Vibe/参考', count: options.referenceImages.length } : null,
         options.characterReferences?.length ? { label: '角色参考', count: options.characterReferences.length } : null,
       ].filter(Boolean),
+      comparisonFingerprint,
     };
     pendingSnapshotCaptures.push(pending);
     let session = null;
     scheduleRefresh();
     updateGenerateClickOverlay();
     try {
-      const invocationArgs = [...invocation.args];
-      if (forceNewSeed) {
-        const invocationOptions = invocationArgs[0] || {};
-        invocationArgs[0] = {
-          ...invocationOptions,
-          params: { ...(invocationOptions.params || {}), seed: createUnfixedImageSeed() },
-        };
-      }
-      const validationDeadline = now() + GENERATION_TIMEOUT_MS;
-      while (cachedBusy && now() < validationDeadline) {
+      while (cachedBusy) {
         if (pending.cancelled) return;
         await sleep(100);
         await refreshBusyCache();
@@ -2150,6 +2344,7 @@
       session = createCaptureSession('enqueue', {
         costText: pending.costText,
         activation: activeInvocation.activate,
+        comparisonFingerprint: pending.comparisonFingerprint,
       });
       const wasNovelAIBusy = Boolean(activeBusyRelease.atom && activeBusyRelease.store.get(activeBusyRelease.atom));
       if (wasNovelAIBusy) activeBusyRelease.store.set(activeBusyRelease.atom, false);
@@ -2165,8 +2360,16 @@
         }
       }
       if (!validationPassed) {
+        const duplicateValidationSeen = session.duplicateValidationSeen;
         discardCaptureSession(session);
-        notify('参数与上次生成完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列。', 'info');
+        if (duplicateValidationSeen) {
+          await recordDuplicatePendingAsFinished(pending);
+          notify('该任务与之前的设置和 Seed 完全重复，已记入完成并继续队列。', 'info');
+          notifyPeers('kick');
+          kickScheduler();
+        } else {
+          notify('NovelAI 未产生生成请求，本次未加入队列；请检查页面上的参数提示。', 'error');
+        }
       }
     } catch (error) {
       if (session) discardCaptureSession(session);
@@ -2234,6 +2437,7 @@
       const index = captureSessions.indexOf(session);
       if (index >= 0) captureSessions.splice(index, 1);
       nativeClearTimeout(session.cleanupTimer);
+      session.validationObserver?.disconnect();
       throw error;
     }
   }
@@ -2369,6 +2573,7 @@
       return `重试 ${job.queueRetry}/${cachedState.settings.maxRetries} · ${seconds}s`;
     }
     if (job.status === 'success') return '成功';
+    if (job.status === 'duplicate') return '重复设置';
     if (job.status === 'unknown') return '结果未知';
     if (job.status === 'failed') return '失败';
     if (job.status === 'deleted_pending') return '等待删除';
@@ -2377,7 +2582,7 @@
 
   function statusClass(job) {
     if (job.status === 'success') return 'success';
-    if (job.status === 'failed' || job.status === 'unknown') return 'error';
+    if (job.status === 'failed' || job.status === 'unknown' || job.status === 'duplicate') return 'error';
     if (job.status === 'running') return 'running';
     if (job.status === 'retry_wait') return 'retry';
     return 'queued';
@@ -2657,7 +2862,7 @@
     const jobs = await getAllJobs();
     const targets = jobs.filter((job) => kind === 'queue'
       ? ['queued', 'running', 'retry_wait', 'deleted_pending'].includes(job.status)
-      : ['success', 'failed', 'unknown'].includes(job.status));
+      : ['success', 'failed', 'unknown', 'duplicate'].includes(job.status));
     for (const job of targets) {
       if (currentExecution?.jobId === job.id) {
         for (const controller of currentExecution.controllers) controller.abort(new Error('Queue cleared by user.'));
@@ -2978,6 +3183,7 @@
         .generate-hitbox { position: fixed; z-index: 2147482500; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 4px 8px 4px 12px; border: 0; border-radius: 4px; color: rgb(19, 21, 44); background: transparent !important; box-shadow: none; cursor: pointer; font: 700 16px/24px "Source Sans Pro", system-ui, sans-serif; text-align: left; pointer-events: auto; }
         .generate-hitbox[data-mode="queue"] { background: rgb(245, 243, 194) !important; }
         .generate-hitbox[data-mode="queue"]:hover { background: rgb(255, 253, 207) !important; }
+        .generate-hitbox-label { color: rgb(112, 119, 194); }
         .generate-hitbox-cost { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 4px; color: rgb(245, 243, 194); background: rgb(19, 21, 44); }
         .generate-hitbox-cost[hidden] { display: none; }
         .generate-hitbox-cost-value { min-width: 20px; text-align: center; }
@@ -3269,7 +3475,7 @@
 
     const queued = queueJobs(cachedJobs).filter((job) => job.status !== 'deleted_pending');
     const finished = cachedJobs
-      .filter((job) => ['success', 'failed', 'unknown'].includes(job.status))
+      .filter((job) => ['success', 'failed', 'unknown', 'duplicate'].includes(job.status))
       .sort((a, b) => Number(b.endedAt || 0) - Number(a.endedAt || 0));
     const pendingSnapshots = pendingSnapshotCaptures.filter((pending) => !pending.cancelled);
     const queueTotal = queued.length + pendingSnapshots.length;
@@ -3356,6 +3562,7 @@
     window.addEventListener('scroll', updateGenerateClickOverlay, { passive: true, capture: true });
     window.addEventListener('resize', scheduleHistorySaveIndicatorUpdate, { passive: true });
     document.addEventListener('pointerdown', deferHistoryIndicatorDuringInteraction, { passive: true, capture: true });
+    document.addEventListener('click', rememberDirectGenerationFingerprint, { capture: true });
     document.addEventListener('click', deferHistoryIndicatorDuringInteraction, { passive: true, capture: true });
 
     nativeSetInterval(() => {
