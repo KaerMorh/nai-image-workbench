@@ -46,10 +46,10 @@ test('keeps results in NovelAI by resolving the original fetch promise', () => {
   assert.doesNotMatch(source, /delete image/i);
 });
 
-test('uses a blue hitbox and restores NovelAI disabled state for carrier dispatch', () => {
+test('uses the agreed queue hitbox color and restores NovelAI disabled state for carrier dispatch', () => {
   assert.match(source, /class="generate-hitbox"/);
   assert.match(source, /addEventListener\('click', onGenerateOverlayClick\)/);
-  assert.match(source, /background: #1687df !important/);
+  assert.match(source, /background: rgb\(112, 119, 194\) !important/);
   assert.match(source, /overlay\.textContent = shouldCaptureGenerateClick\(\) \? '加入队列'/);
   assert.match(source, /const domDisabled = button\.disabled/);
   assert.match(source, /if \(domDisabled\) button\.disabled = true/);
@@ -142,6 +142,8 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /与外部按钮功能相同/);
   assert.match(source, /<small class="settings-credit">by KaerMorh<\/small>/);
   assert.match(source, /historySaveIndicator: true/);
+  assert.match(source, /toastDurationMs: 2_000/);
+  assert.match(source, /\.tabs button span \{ margin-left: 9px; \}/);
   assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
 });
 
@@ -172,6 +174,17 @@ test('runs batch replacement as a single current item and consumes it only on su
   assert.match(source, /scheduleBatchController/);
   assert.match(source, /if \(jobs\.length \|\| cachedBusy/);
   assert.match(source, /source: 'batch-replace'/);
+});
+
+test('warns before starting adjacent duplicate batch items with a fixed Seed', () => {
+  assert.match(source, /function findAdjacentDuplicateBatchItems/);
+  assert.match(source, /function readNativeFixedSeed/);
+  assert.match(source, /control instanceof HTMLInputElement \? control\.value : control\.textContent/);
+  assert.match(source, /fixedSeed: readNativeFixedSeed\(\)/);
+  assert.match(source, /plan\.fixedSeed !== null && adjacentDuplicates\.length/);
+  assert.match(source, /window\.confirm\(/);
+  assert.match(source, /选择“确定”继续执行；选择“取消”返回修改列表/);
+  assert.match(source, /已取消启动批量替换，请修改相邻重复项后再试/);
 });
 
 test('provides a dedicated editable batch UI with pause, stop, retry, skip, and refresh controls', () => {

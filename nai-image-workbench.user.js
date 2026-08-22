@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.4
+// @version      0.6.5
 // @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/image*
@@ -17,7 +17,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.4';
+  const SCRIPT_VERSION = '0.6.5';
   const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
@@ -92,7 +92,7 @@
         maxRetries: QUEUE_RETRY_DELAYS_MS.length,
         interJobDelayMs: INTER_JOB_DELAY_MS,
         maxFinished: MAX_FINISHED,
-        toastDurationMs: 4_000,
+        toastDurationMs: 2_000,
         toastPosition: 'top-right',
         historySaveIndicator: true,
       },
@@ -157,7 +157,7 @@
       maxRetries: Math.round(clampNumber(value.maxRetries, 0, QUEUE_RETRY_DELAYS_MS.length, QUEUE_RETRY_DELAYS_MS.length)),
       interJobDelayMs: Math.round(clampNumber(value.interJobDelayMs, 500, 10_000, INTER_JOB_DELAY_MS)),
       maxFinished: Math.round(clampNumber(value.maxFinished, 10, MAX_FINISHED, MAX_FINISHED)),
-      toastDurationMs: Math.round(clampNumber(value.toastDurationMs, 1_000, 30_000, 4_000)),
+      toastDurationMs: Math.round(clampNumber(value.toastDurationMs, 1_000, 30_000, 2_000)),
       toastPosition,
       historySaveIndicator: value.historySaveIndicator !== false,
     };
@@ -208,6 +208,51 @@
       .split(/\r?\n/)
       .map((item) => item.trim())
       .filter(Boolean);
+  }
+
+  function findAdjacentDuplicateBatchItems(items) {
+    const duplicates = [];
+    for (let index = 1; index < items.length; index += 1) {
+      if (items[index] === items[index - 1]) {
+        duplicates.push({ value: items[index], first: index, second: index + 1 });
+      }
+    }
+    return duplicates;
+  }
+
+  function readNativeFixedSeed() {
+    const parseSeed = (value) => {
+      const text = String(value ?? '').trim();
+      if (!/^\d+$/.test(text)) return null;
+      const seed = Number(text);
+      return Number.isSafeInteger(seed) ? seed : null;
+    };
+    const isVisible = (element) => {
+      const style = window.getComputedStyle(element);
+      return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+    };
+    const inputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+    for (const input of inputs) {
+      const identity = [input.name, input.id, input.getAttribute('aria-label'), input.placeholder]
+        .filter(Boolean)
+        .join(' ');
+      if (/\bseed\b/i.test(identity)) {
+        const seed = parseSeed(input.value);
+        if (seed !== null) return seed;
+      }
+    }
+    const seedLabels = Array.from(document.querySelectorAll('label, span, div'))
+      .filter((element) => isVisible(element) && element.textContent?.trim() === 'Seed');
+    for (const label of seedLabels) {
+      const container = label.parentElement;
+      if (!container) continue;
+      for (const control of container.querySelectorAll('input, button, [role="spinbutton"]')) {
+        if (!isVisible(control)) continue;
+        const seed = parseSeed(control instanceof HTMLInputElement ? control.value : control.textContent);
+        if (seed !== null) return seed;
+      }
+    }
+    return null;
   }
 
   function inspectPromptTemplate(prompt) {
@@ -2054,6 +2099,7 @@
       width: Number(options.params?.width) || null,
       height: Number(options.params?.height) || null,
       imageCount: Number(options.params?.n_samples) || 1,
+      fixedSeed: readNativeFixedSeed(),
     };
   }
 
@@ -2111,6 +2157,25 @@
     }
     try {
       const plan = await captureCurrentBatchPlan();
+      const adjacentDuplicates = findAdjacentDuplicateBatchItems(items);
+      if (plan.fixedSeed !== null && adjacentDuplicates.length) {
+        const duplicatePreview = adjacentDuplicates.slice(0, 5)
+          .map((item) => `第 ${item.first}、${item.second} 项：${truncate(item.value, 48)}`)
+          .join('\n');
+        const remaining = adjacentDuplicates.length > 5
+          ? `\n另有 ${adjacentDuplicates.length - 5} 处相邻重复。`
+          : '';
+        const shouldContinue = window.confirm(
+          `当前使用固定 Seed ${plan.fixedSeed}，替换列表中存在相邻且完全相同的提示词段：\n\n`
+          + `${duplicatePreview}${remaining}\n\n`
+          + '后一项可能被 NovelAI 判定为与上次参数相同。\n\n'
+          + '选择“确定”继续执行；选择“取消”返回修改列表。',
+        );
+        if (!shouldContinue) {
+          notify('已取消启动批量替换，请修改相邻重复项后再试。', 'info');
+          return;
+        }
+      }
       const id = crypto.randomUUID();
       const current = {
         id: crypto.randomUUID(),
@@ -2740,6 +2805,7 @@
         button.danger { color: #ffc5c5; border-color: #744a57; }
         button.primary { color: #141936; background: #f5f3c2; border-color: #f5f3c2; }
         .tabs { display: grid; grid-template-columns: 1fr 1fr 1.15fr; gap: 6px; padding: 8px 10px 0; }
+        .tabs button span { margin-left: 9px; }
         .tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
         .body { min-height: 140px; overflow: auto; padding: 8px 10px 10px; }
         .view[hidden] { display: none; }
@@ -2800,8 +2866,8 @@
         .settings-credit { color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
         .settings-actions { display: flex; justify-content: flex-end; gap: 7px; }
         .generate-hitbox { position: fixed; z-index: 2147482500; display: block; margin: 0; padding: 0; border: 0; border-radius: 3px; color: #fff; background: transparent !important; box-shadow: none; cursor: pointer; font: 700 15px/1 system-ui, sans-serif; }
-        .generate-hitbox[data-mode="queue"] { border: 1px solid #65b9ff; background: #1687df !important; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset, 0 5px 16px rgba(0,105,210,.35); }
-        .generate-hitbox[data-mode="queue"]:hover { background: #2999ef !important; border-color: #9ad2ff; }
+        .generate-hitbox[data-mode="queue"] { border: 1px solid rgb(143, 149, 218); background: rgb(112, 119, 194) !important; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset, 0 5px 16px rgba(72,78,150,.38); }
+        .generate-hitbox[data-mode="queue"]:hover { background: rgb(126, 133, 207) !important; border-color: rgb(170, 175, 231); }
         .generate-hitbox[data-paused="true"] { cursor: not-allowed; }
         .generate-hitbox[hidden] { display: none; }
         @media (max-width: 700px) { .panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 64vh; } }
@@ -2814,9 +2880,9 @@
           <button class="collapse" type="button" aria-label="折叠">—</button>
         </header>
         <nav class="tabs">
-          <button type="button" data-tab="queue">队列 <span class="queue-count">0</span></button>
-          <button type="button" data-tab="finished">已结束 <span class="finished-count">0</span></button>
-          <button type="button" data-tab="batch">批量替换 <span class="batch-count">0</span></button>
+          <button type="button" data-tab="queue">队列<span class="queue-count">0</span></button>
+          <button type="button" data-tab="finished">已结束<span class="finished-count">0</span></button>
+          <button type="button" data-tab="batch">批量替换<span class="batch-count">0</span></button>
         </nav>
         <div class="body">
           <div class="queue-view view">
