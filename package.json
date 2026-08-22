@@ -1,0 +1,8 @@
+{
+  "name": "novelai-toolbox-generation-queue",
+  "version": "0.6.1",
+  "private": true,
+  "scripts": {
+    "test": "node --check novelai-toolbox.user.js && node --test tests/static.test.mjs"
+  }
+}
