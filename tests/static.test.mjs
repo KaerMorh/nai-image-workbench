@@ -46,23 +46,53 @@ test('keeps results in NovelAI by resolving the original fetch promise', () => {
   assert.doesNotMatch(source, /delete image/i);
 });
 
-test('uses the agreed queue hitbox color and restores NovelAI disabled state for carrier dispatch', () => {
+test('matches the NovelAI generate button and restores NovelAI disabled state for carrier dispatch', () => {
   assert.match(source, /class="generate-hitbox"/);
   assert.match(source, /addEventListener\('click', onGenerateOverlayClick\)/);
-  assert.match(source, /background: rgb\(112, 119, 194\) !important/);
-  assert.match(source, /overlay\.textContent = shouldCaptureGenerateClick\(\) \? '加入队列'/);
+  assert.match(source, /background: rgb\(245, 243, 194\) !important/);
+  assert.match(source, /class="generate-hitbox-label"/);
+  assert.match(source, /class="generate-hitbox-cost"/);
+  assert.match(source, /label\.textContent = queueMode \? '加入队列'/);
+  assert.match(source, /capturedPrice: extractCapturedPrice\(target\.innerText\)/);
+  assert.match(source, /pending\.capturedPrice.*Anlas/);
   assert.match(source, /const domDisabled = button\.disabled/);
   assert.match(source, /if \(domDisabled\) button\.disabled = true/);
+  assert.match(source, /const buttons = Array\.from\(document\.querySelectorAll\('button\.image-gen-generate-button'\)\)/);
+  assert.match(source, /rect\.width > 0 && rect\.height > 0/);
+  assert.match(source, /:host \{ all: initial; position: fixed; inset: 0; z-index: 2147483646; display: block; pointer-events: none; \}/);
+  assert.match(source, /\.panel \{[^}]+pointer-events: auto;/);
+  assert.match(source, /\.generate-hitbox \{[^}]+pointer-events: auto;/);
   assert.doesNotMatch(source, /removeAttribute\('disabled'\)/);
   assert.doesNotMatch(source, /setAttribute\('disabled'/);
 });
 
+test('drops previous-page execution locks without pausing the reopened page', () => {
+  assert.match(source, /async function discardPreviousPageExecutionLocks\(jobs = \[\]\)/);
+  assert.match(source, /\['queued', 'running', 'retry_wait'\]\.includes\(job\.status\)/);
+  assert.match(source, /\{ tabId: ownerTabId, heartbeatAt: now\(\), gone: true \}/);
+  assert.match(source, /if \(busy\?\.tabId && busy\.tabId !== TAB_ID\) await updateBusy\(null\)/);
+  assert.match(source, /await discardPreviousPageExecutionLocks\(cachedJobs\)/);
+  assert.match(source, /\{ pauseOnFailure: false \}/);
+  assert.match(source, /旧锁已解除，队列继续/);
+});
+
 test('captures current React generation parameters without sending in parallel', () => {
   assert.match(source, /root\.stateNode\?\.current === root \? attached : attached\.alternate/);
+  assert.match(source, /source\.includes\('\{force:'\)/);
+  assert.match(source, /source\.includes\('\.onGenerated'\)/);
+  assert.match(source, /source\.includes\('\.modifyImage'\)/);
+  assert.match(source, /source\.includes\('gridXLength'\) && source\.includes\('gridYLength'\)/);
   assert.match(source, /captureLowLevelGeneration/);
   assert.match(source, /pendingSnapshotCaptures/);
-  assert.match(source, /invocation\.originalMethod\.apply\(invocation\.thisArg, invocation\.args\)/);
-  assert.match(source, /activation: invocation\.activate/);
+  assert.match(source, /activeInvocation\.originalMethod\.apply\(activeInvocation\.thisArg, invocationArgs\)/);
+  assert.match(source, /activation: activeInvocation\.activate/);
+  assert.match(source, /const forceNewSeed = readNativeFixedSeed\(\) === null/);
+  assert.match(source, /captureGenerationInvocation\(preparedCallback, busyRelease, \{ force: forceNewSeed \}\)/);
+  assert.match(source, /function createUnfixedImageSeed\(\)/);
+  assert.match(source, /if \(forceNewSeed\) \{\s*const invocationOptions = invocationArgs\[0\] \|\| \{};/);
+  assert.match(source, /seed: createUnfixedImageSeed\(\)/);
+  assert.match(source, /if \(wasNovelAIBusy\) activeBusyRelease\.store\.set\(activeBusyRelease\.atom, false\)/);
+  assert.match(source, /returned = activeInvocation\.originalMethod\.apply\(activeInvocation\.thisArg, invocationArgs\)/);
 });
 
 test('parses multipart request JSON and preserves NovelAI request seeds across retries', () => {
@@ -75,13 +105,16 @@ test('parses multipart request JSON and preserves NovelAI request seeds across r
   assert.match(source, /headers: job\.requestHeaders \|\| prepared\.headers/);
 });
 
-test('runs NovelAI validation immediately and only queues a produced request', () => {
+test('waits for the active generation, then queues only a NovelAI-produced request', () => {
   assert.match(source, /session\.type === 'enqueue'/);
-  assert.match(source, /session\.capturePromise/);
-  assert.match(source, /const validationPassed = await Promise\.race/);
-  assert.match(source, /NovelAI 未通过当前参数校验，本次未加入队列/);
+  assert.match(source, /while \(cachedBusy && now\(\) < validationDeadline\)/);
+  assert.match(source, /let activeInvocation = invocation/);
+  assert.match(source, /activation: activeInvocation\.activate/);
+  assert.match(source, /validationPassed = await waitForCaptureSession\(session, 1_500\)/);
+  assert.match(source, /参数与上次生成完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列/);
   assert.match(source, /runtime\.activation\(\)/);
-  assert.match(source, /等待 NovelAI 校验/);
+  assert.match(source, /status\.textContent = '等待生成'/);
+  assert.doesNotMatch(source, /等待 NovelAI 校验/);
   assert.doesNotMatch(source, /drainSnapshotCaptures/);
 });
 
@@ -180,6 +213,8 @@ test('warns before starting adjacent duplicate batch items with a fixed Seed', (
   assert.match(source, /function findAdjacentDuplicateBatchItems/);
   assert.match(source, /function readNativeFixedSeed/);
   assert.match(source, /control instanceof HTMLInputElement \? control\.value : control\.textContent/);
+  assert.match(source, /use the seed of the displayed image/);
+  assert.match(source, /sort\(\(left, right\) => left\.querySelectorAll\('\*'\)\.length - right\.querySelectorAll\('\*'\)\.length\)/);
   assert.match(source, /fixedSeed: readNativeFixedSeed\(\)/);
   assert.match(source, /plan\.fixedSeed !== null && adjacentDuplicates\.length/);
   assert.match(source, /window\.confirm\(/);

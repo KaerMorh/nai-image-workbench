@@ -242,17 +242,26 @@
       }
     }
     const seedLabels = Array.from(document.querySelectorAll('label, span, div'))
-      .filter((element) => isVisible(element) && element.textContent?.trim() === 'Seed');
+      .filter((element) => isVisible(element) && element.textContent?.trim() === 'Seed')
+      .sort((left, right) => left.querySelectorAll('*').length - right.querySelectorAll('*').length);
     for (const label of seedLabels) {
-      const container = label.parentElement;
+      const container = label.matches('label') ? label : label.parentElement;
       if (!container) continue;
       for (const control of container.querySelectorAll('input, button, [role="spinbutton"]')) {
         if (!isVisible(control)) continue;
+        const identity = [control.getAttribute('aria-label'), control.title]
+          .filter(Boolean)
+          .join(' ');
+        if (/use the seed of the displayed image|使用.*显示.*图像.*seed/i.test(identity)) return null;
         const seed = parseSeed(control instanceof HTMLInputElement ? control.value : control.textContent);
         if (seed !== null) return seed;
       }
     }
     return null;
+  }
+
+  function createUnfixedImageSeed() {
+    return crypto.getRandomValues(new Uint32Array(1))[0];
   }
 
   function inspectPromptTemplate(prompt) {
@@ -659,6 +668,11 @@
     return flags;
   }
 
+  function extractCapturedPrice(costText = '') {
+    const priceMatch = String(costText).match(/(?:^|\s)(\d+(?:\.\d+)?)\s*(?:Anlas|$)/i);
+    return priceMatch ? Number(priceMatch[1]) : null;
+  }
+
   function extractSummary(bodyText, costText = '') {
     const payload = parseGenerationPayload(bodyText) || {};
     const params = payload.parameters || {};
@@ -669,7 +683,6 @@
       payload.prompt ??
       payload.input ??
       '(无法读取 Prompt)';
-    const priceMatch = String(costText).match(/(?:^|\s)(\d+(?:\.\d+)?)\s*(?:Anlas|$)/i);
     return {
       promptPreview: truncate(basePrompt, 80),
       model: String(payload.model || '未知模型'),
@@ -677,7 +690,7 @@
       height: Number(params.height) || null,
       imageCount: Number(params.n_samples) || 1,
       imageFlags: extractImageFlags(payload),
-      capturedPrice: priceMatch ? Number(priceMatch[1]) : null,
+      capturedPrice: extractCapturedPrice(costText),
     };
   }
 
@@ -785,6 +798,23 @@
     const busy = await getMeta('busy');
     cachedBusy = isBusyFresh(busy) ? busy : null;
     return cachedBusy;
+  }
+
+  async function discardPreviousPageExecutionLocks(jobs = []) {
+    const busy = await getMeta('busy');
+    const previousOwnerIds = new Set(
+      jobs
+        .filter((job) => ['queued', 'running', 'retry_wait'].includes(job.status))
+        .map((job) => job.ownerTabId)
+        .filter((ownerTabId) => ownerTabId && ownerTabId !== TAB_ID),
+    );
+    if (busy?.tabId && busy.tabId !== TAB_ID) previousOwnerIds.add(busy.tabId);
+    await Promise.all(Array.from(previousOwnerIds, (ownerTabId) => setMeta(
+      `tab:${ownerTabId}`,
+      { tabId: ownerTabId, heartbeatAt: now(), gone: true },
+      { broadcast: false },
+    )));
+    if (busy?.tabId && busy.tabId !== TAB_ID) await updateBusy(null);
   }
 
   async function beginBusy(kind, jobId = null) {
@@ -1107,8 +1137,16 @@
       if (Array.isArray(value) && typeof value[0] === 'function') {
         const candidate = value[0];
         const source = String(candidate);
-        if (source.includes('let i=sF(') && source.includes('sG(')) normalCallback = candidate;
-        else if (source.includes('sT(') && source.includes('gridXLength') && source.includes('sG(')) gridCallback = candidate;
+        const isCurrentNormalCallback = source.includes('{force:')
+          && source.includes('.start')
+          && source.includes('.container')
+          && source.includes('.onGenerated')
+          && source.includes('.modifyImage');
+        const isLegacyNormalCallback = source.includes('let i=sF(') && source.includes('sG(');
+        const isCurrentGridCallback = source.includes('gridXLength') && source.includes('gridYLength');
+        const isLegacyGridCallback = source.includes('sT(') && source.includes('gridXLength') && source.includes('sG(');
+        if (isCurrentNormalCallback || isLegacyNormalCallback) normalCallback = candidate;
+        else if (isCurrentGridCallback || isLegacyGridCallback) gridCallback = candidate;
       }
       if (Array.isArray(value) && value[1] === busyAccess.store && value[2]) {
         try {
@@ -1128,7 +1166,7 @@
     return { selected, wantsGrid, atomSnapshot, generationApi };
   }
 
-  async function captureGenerationInvocation(preparedCallback, busyAccess) {
+  async function captureGenerationInvocation(preparedCallback, busyAccess, { force = false } = {}) {
     const methodName = preparedCallback.wantsGrid && typeof preparedCallback.generationApi.generateGrid === 'function'
       ? 'generateGrid'
       : 'generateNormal';
@@ -1164,7 +1202,7 @@
     try {
       const returned = preparedCallback.wantsGrid
         ? preparedCallback.selected(get, set)
-        : preparedCallback.selected(get, set, false);
+        : preparedCallback.selected(get, set, force);
       if (returned && typeof returned.catch === 'function') {
         returned.catch((error) => console.error('[NAI Image Workbench] Generation plan capture failed:', error));
       }
@@ -1188,7 +1226,12 @@
   }
 
   function findGenerateButton() {
-    return document.querySelector('button.image-gen-generate-button');
+    const buttons = Array.from(document.querySelectorAll('button.image-gen-generate-button'));
+    return buttons.find((button) => {
+      const rect = button.getBoundingClientRect();
+      const style = getComputedStyle(button);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    }) || buttons[0] || null;
   }
 
   function createCaptureSession(type, details = {}) {
@@ -1550,7 +1593,7 @@
     notify('批量替换当前项失败，已暂停且保留该单位。', 'error');
   }
 
-  async function finishJob(jobId, status, error = null) {
+  async function finishJob(jobId, status, error = null, { pauseOnFailure = true } = {}) {
     const updated = await updateJob(jobId, (job) => {
       if (job.status === 'deleted_pending') return job;
       return {
@@ -1566,7 +1609,7 @@
     runtimeJobs.delete(jobId);
     await trimFinishedJobs();
     await handleBatchJobFinished(updated);
-    if (status !== 'success' && !updated?.batchId) await saveState({ paused: true });
+    if (pauseOnFailure && status !== 'success' && !updated?.batchId) await saveState({ paused: true });
     scheduleRefresh();
     return updated;
   }
@@ -1869,9 +1912,14 @@
       if (!head) return;
       if (head.status === 'running') {
         if (currentExecution?.jobId === head.id || await isOwnerAlive(head.ownerTabId)) return;
-        await finishJob(head.id, 'unknown', '执行标签页已关闭或失去响应，无法确认远端请求结果。');
-        await saveState({ paused: true });
-        notify('发现失去执行页面的任务，已标为“结果未知”并暂停。', 'error');
+        await finishJob(
+          head.id,
+          'unknown',
+          '执行标签页已关闭或重新载入，无法确认远端请求结果。',
+          { pauseOnFailure: false },
+        );
+        notify('上一页面的生成任务已标为“结果未知”，旧锁已解除，队列继续。', 'error');
+        kickScheduler();
         return;
       }
       const busy = await refreshBusyCache();
@@ -1969,8 +2017,28 @@
     overlay.style.width = `${rect.width}px`;
     overlay.style.height = `${rect.height}px`;
     overlay.dataset.paused = cachedState.paused ? 'true' : 'false';
-    overlay.dataset.mode = shouldCaptureGenerateClick() ? 'queue' : 'blocked';
-    overlay.textContent = shouldCaptureGenerateClick() ? '加入队列' : '';
+    const queueMode = shouldCaptureGenerateClick();
+    overlay.dataset.mode = queueMode ? 'queue' : 'blocked';
+    const label = overlay.querySelector('.generate-hitbox-label');
+    const cost = overlay.querySelector('.generate-hitbox-cost');
+    const costValue = overlay.querySelector('.generate-hitbox-cost-value');
+    const costIcon = overlay.querySelector('.generate-hitbox-cost-icon');
+    label.textContent = queueMode ? '加入队列' : '';
+    const capturedPrice = extractCapturedPrice(button.innerText);
+    cost.hidden = !queueMode || capturedPrice === null;
+    if (capturedPrice !== null) costValue.textContent = String(capturedPrice);
+    const nativeCostIcon = Array.from(button.querySelectorAll('*')).find((element) => {
+      const style = getComputedStyle(element);
+      return style.maskImage && style.maskImage !== 'none';
+    });
+    if (nativeCostIcon) {
+      const nativeIconStyle = getComputedStyle(nativeCostIcon);
+      costIcon.style.maskImage = nativeIconStyle.maskImage;
+      costIcon.style.webkitMaskImage = nativeIconStyle.maskImage;
+    }
+    overlay.setAttribute('aria-label', capturedPrice === null
+      ? '把当前 NovelAI 配置加入队列'
+      : `把当前 NovelAI 配置加入队列，消耗 ${capturedPrice} Anlas`);
     overlay.title = cachedState.paused
       ? '队列已暂停；当前生成结束前不能直接生成'
       : '点击会把当前配置加入 NAI Image Workbench 队列';
@@ -2013,9 +2081,10 @@
       void saveState({ paused: true }).then(scheduleRefresh);
       return;
     }
+    const forceNewSeed = readNativeFixedSeed() === null;
     const invocation = await (snapshotProbeChain = snapshotProbeChain
       .catch(() => undefined)
-      .then(() => captureGenerationInvocation(preparedCallback, busyRelease)));
+      .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed })));
     if (!invocation) {
       notify('无法完整读取当前配置，队列已暂停。', 'error');
       void saveState({ paused: true }).then(scheduleRefresh);
@@ -2028,6 +2097,7 @@
       invocation,
       busyAccess: busyRelease,
       costText: target.innerText,
+      capturedPrice: extractCapturedPrice(target.innerText),
       wantsGrid: preparedCallback.wantsGrid,
       promptPreview: truncate(options.prompt || '(正在读取 Prompt)', 80),
       model: String(options.model || '未知模型'),
@@ -2041,26 +2111,65 @@
       ].filter(Boolean),
     };
     pendingSnapshotCaptures.push(pending);
-    const session = createCaptureSession('enqueue', {
-      costText: target.innerText,
-      activation: invocation.activate,
-    });
+    let session = null;
     scheduleRefresh();
     updateGenerateClickOverlay();
     try {
-      const returned = invocation.originalMethod.apply(invocation.thisArg, invocation.args);
-      const validationPassed = await Promise.race([
-        session.capturePromise,
-        returned && typeof returned.then === 'function'
-          ? Promise.resolve(returned).then(() => false, () => false)
-          : Promise.resolve(false),
-      ]);
+      const invocationArgs = [...invocation.args];
+      if (forceNewSeed) {
+        const invocationOptions = invocationArgs[0] || {};
+        invocationArgs[0] = {
+          ...invocationOptions,
+          params: { ...(invocationOptions.params || {}), seed: createUnfixedImageSeed() },
+        };
+      }
+      const validationDeadline = now() + GENERATION_TIMEOUT_MS;
+      while (cachedBusy && now() < validationDeadline) {
+        if (pending.cancelled) return;
+        await sleep(100);
+        await refreshBusyCache();
+      }
+      if (pending.cancelled) return;
+      let activeInvocation = invocation;
+      let activeBusyRelease = busyRelease;
+      if (!cachedBusy) {
+        const freshButton = findGenerateButton();
+        rememberIdleJotaiAtoms(freshButton);
+        const freshBusyRelease = temporarilyReleaseNovelAIBusy(freshButton);
+        const freshPreparedCallback = freshBusyRelease
+          ? prepareCurrentGenerationCallback(freshButton, freshBusyRelease, preparedCallback.wantsGrid)
+          : null;
+        const freshInvocation = freshPreparedCallback
+          ? await captureGenerationInvocation(freshPreparedCallback, freshBusyRelease, { force: forceNewSeed })
+          : null;
+        if (freshInvocation) {
+          activeInvocation = freshInvocation;
+          activeBusyRelease = freshBusyRelease;
+        }
+      }
+      session = createCaptureSession('enqueue', {
+        costText: pending.costText,
+        activation: activeInvocation.activate,
+      });
+      const wasNovelAIBusy = Boolean(activeBusyRelease.atom && activeBusyRelease.store.get(activeBusyRelease.atom));
+      if (wasNovelAIBusy) activeBusyRelease.store.set(activeBusyRelease.atom, false);
+      let returned;
+      let validationPassed;
+      try {
+        returned = activeInvocation.originalMethod.apply(activeInvocation.thisArg, invocationArgs);
+        if (returned && typeof returned.catch === 'function') returned.catch(() => undefined);
+        validationPassed = await waitForCaptureSession(session, 1_500);
+      } finally {
+        if (wasNovelAIBusy && cachedBusy && !activeBusyRelease.store.get(activeBusyRelease.atom)) {
+          activeBusyRelease.store.set(activeBusyRelease.atom, true);
+        }
+      }
       if (!validationPassed) {
         discardCaptureSession(session);
-        notify('NovelAI 未通过当前参数校验，本次未加入队列。', 'info');
+        notify('参数与上次生成完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列。', 'info');
       }
     } catch (error) {
-      discardCaptureSession(session);
+      if (session) discardCaptureSession(session);
       notify(`NovelAI 参数校验未完成：${error.message || error}`, 'error');
     } finally {
       pending.cancelled = true;
@@ -2356,7 +2465,7 @@
     top.className = 'job-top';
     const status = document.createElement('span');
     status.className = 'status';
-    status.textContent = '等待 NovelAI 校验';
+    status.textContent = '等待生成';
     const time = document.createElement('time');
     time.textContent = new Date(pending.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     top.append(status, time);
@@ -2369,6 +2478,7 @@
       pending.model,
       pending.width && pending.height ? `${pending.width}×${pending.height}` : null,
       `${pending.imageCount} 张`,
+      pending.capturedPrice !== null && pending.capturedPrice !== undefined ? `${pending.capturedPrice} Anlas` : null,
     ].filter(Boolean).join(' · ');
     const badges = document.createElement('div');
     badges.className = 'badges';
@@ -2794,9 +2904,9 @@
     shadow = uiHost.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        :host { all: initial; }
+        :host { all: initial; position: fixed; inset: 0; z-index: 2147483646; display: block; pointer-events: none; }
         * { box-sizing: border-box; }
-        .panel { position: fixed; top: 112px; right: 16px; z-index: 2147483000; width: 380px; max-width: calc(100vw - 24px); max-height: min(72vh, 760px); display: flex; flex-direction: column; color: #fff; background: #141936; border: 1px solid #343a63; border-radius: 10px; box-shadow: 0 14px 42px rgba(0,0,0,.45); font: 14px/1.4 "Source Sans Pro", system-ui, sans-serif; overflow: hidden; }
+        .panel { position: fixed; top: 112px; right: 16px; z-index: 2147483000; width: 380px; max-width: calc(100vw - 24px); max-height: min(72vh, 760px); display: flex; flex-direction: column; color: #fff; background: #141936; border: 1px solid #343a63; border-radius: 10px; box-shadow: 0 14px 42px rgba(0,0,0,.45); font: 14px/1.4 "Source Sans Pro", system-ui, sans-serif; overflow: hidden; pointer-events: auto; }
         .panel.collapsed .body, .panel.collapsed .tabs { display: none; }
         .header { display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: #191b31; border-bottom: 1px solid #343a63; cursor: move; user-select: none; }
         .title { min-width: 0; flex: 1; font: 600 15px/1.2 Eczar, system-ui, sans-serif; color: #f5f3c2; }
@@ -2850,7 +2960,7 @@
         .toast span { flex: 1; }
         .toast.error { border-color: #a94e61; }
         .toast.success { border-color: #4c9f71; }
-        .settings-dialog { position: fixed; top: 112px; right: 16px; z-index: 2147483200; width: 380px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); color: #fff; background: #141936; border: 1px solid #4b5487; border-radius: 10px; box-shadow: 0 18px 52px rgba(0,0,0,.58); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+        .settings-dialog { position: fixed; top: 112px; right: 16px; z-index: 2147483200; width: 380px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); color: #fff; background: #141936; border: 1px solid #4b5487; border-radius: 10px; box-shadow: 0 18px 52px rgba(0,0,0,.58); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; pointer-events: auto; }
         .settings-dialog[hidden] { display: none; }
         .settings-title { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; color: #f5f3c2; background: #191b31; border-bottom: 1px solid #343a63; font-size: 15px; font-weight: 700; cursor: move; user-select: none; }
         .settings-form { max-height: calc(100vh - 78px); overflow-y: auto; padding: 10px 12px 12px; }
@@ -2863,11 +2973,15 @@
         .setting-row input[type="number"], .setting-row select { width: 100%; padding: 6px 7px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 6px; }
         .setting-row input[type="checkbox"] { justify-self: end; width: 19px; height: 19px; accent-color: #1687df; }
         .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; }
-        .settings-credit { color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
+        .settings-credit { margin-left: 10px; color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
         .settings-actions { display: flex; justify-content: flex-end; gap: 7px; }
-        .generate-hitbox { position: fixed; z-index: 2147482500; display: block; margin: 0; padding: 0; border: 0; border-radius: 3px; color: #fff; background: transparent !important; box-shadow: none; cursor: pointer; font: 700 15px/1 system-ui, sans-serif; }
-        .generate-hitbox[data-mode="queue"] { border: 1px solid rgb(143, 149, 218); background: rgb(112, 119, 194) !important; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset, 0 5px 16px rgba(72,78,150,.38); }
-        .generate-hitbox[data-mode="queue"]:hover { background: rgb(126, 133, 207) !important; border-color: rgb(170, 175, 231); }
+        .generate-hitbox { position: fixed; z-index: 2147482500; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 4px 8px 4px 12px; border: 0; border-radius: 4px; color: rgb(19, 21, 44); background: transparent !important; box-shadow: none; cursor: pointer; font: 700 16px/24px "Source Sans Pro", system-ui, sans-serif; text-align: left; pointer-events: auto; }
+        .generate-hitbox[data-mode="queue"] { background: rgb(245, 243, 194) !important; }
+        .generate-hitbox[data-mode="queue"]:hover { background: rgb(255, 253, 207) !important; }
+        .generate-hitbox-cost { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 4px; color: rgb(245, 243, 194); background: rgb(19, 21, 44); }
+        .generate-hitbox-cost[hidden] { display: none; }
+        .generate-hitbox-cost-value { min-width: 20px; text-align: center; }
+        .generate-hitbox-cost-icon { width: 10px; height: 10px; flex: 0 0 10px; background: rgb(245, 243, 194); mask-position: center; mask-repeat: no-repeat; mask-size: contain; }
         .generate-hitbox[data-paused="true"] { cursor: not-allowed; }
         .generate-hitbox[hidden] { display: none; }
         @media (max-width: 700px) { .panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 64vh; } }
@@ -2945,7 +3059,7 @@
           </div>
         </form>
       </section>
-      <button class="generate-hitbox" type="button" aria-label="把当前 NovelAI 配置加入队列" hidden></button>
+      <button class="generate-hitbox" type="button" aria-label="把当前 NovelAI 配置加入队列" hidden><span class="generate-hitbox-label"></span><span class="generate-hitbox-cost" hidden><span class="generate-hitbox-cost-value"></span><span class="generate-hitbox-cost-icon" aria-hidden="true"></span></span></button>
       <div class="toast-stack" aria-live="polite"></div>
     `;
     document.documentElement.append(uiHost);
@@ -3203,6 +3317,7 @@
     await markTabHeartbeat(false);
     cachedState = await loadState();
     cachedJobs = await getAllJobs();
+    await discardPreviousPageExecutionLocks(cachedJobs);
     if (['capturing', 'running'].includes(cachedState.batch.status)) {
       const recoveredJob = cachedState.batch.current?.jobId
         ? cachedJobs.find((job) => job.id === cachedState.batch.current.jobId)
@@ -3234,6 +3349,7 @@
       childList: true,
       subtree: true,
       attributes: true,
+      characterData: true,
       attributeFilter: ['disabled', 'aria-disabled', 'class', 'style'],
     });
     window.addEventListener('resize', updateGenerateClickOverlay, { passive: true });
