@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.5
+// @version      0.6.6
 // @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/image*
@@ -17,7 +17,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.5';
+  const SCRIPT_VERSION = '0.6.6';
   const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
