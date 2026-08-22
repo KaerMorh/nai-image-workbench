@@ -87,7 +87,7 @@
   function defaultState() {
     return {
       paused: false,
-      collapsed: false,
+      collapsed: true,
       activeTab: 'queue',
       position: null,
       settingsPosition: null,
@@ -100,7 +100,7 @@
         maxFinished: MAX_FINISHED,
         toastDurationMs: 2_000,
         toastPosition: 'top-right',
-        historySaveIndicator: true,
+        historySaveIndicator: false,
       },
     };
   }
@@ -165,7 +165,7 @@
       maxFinished: Math.round(clampNumber(value.maxFinished, 10, MAX_FINISHED, MAX_FINISHED)),
       toastDurationMs: Math.round(clampNumber(value.toastDurationMs, 1_000, 30_000, 2_000)),
       toastPosition,
-      historySaveIndicator: value.historySaveIndicator !== false,
+      historySaveIndicator: Boolean(value.historySaveIndicator),
     };
   }
 
@@ -3176,6 +3176,11 @@
     }
   }
 
+  async function togglePanelCollapsed() {
+    await saveState({ collapsed: !cachedState.collapsed });
+    scheduleRefresh();
+  }
+
   function buildUi() {
     if (document.getElementById('nai-image-workbench-host')) return;
     uiHost = document.createElement('div');
@@ -3193,13 +3198,27 @@
         button:hover { border-color: #777fae; background: #2c3153; }
         button.danger { color: #ffc5c5; border-color: #744a57; }
         button.primary { color: #141936; background: #f5f3c2; border-color: #f5f3c2; }
+        .collapse { width: 30px; min-width: 30px; flex: 0 0 30px; padding-inline: 0; text-align: center; }
+        .queue-status-bar { --status-color: #7f86ad; display: flex; width: 100%; min-height: 27px; align-items: center; justify-content: space-between; gap: 12px; overflow: hidden; padding: 4px 10px; color: #afb5d5; background: #151832; border: 0; border-bottom: 1px solid rgba(52,58,99,.7); border-radius: 0; font-size: 11px; font-weight: 600; text-align: left; white-space: nowrap; }
+        .queue-status-bar:hover { color: #dce0f8; background: #191d39; border-color: rgba(65,72,111,.9); }
+        .queue-status-main { display: inline-flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; }
+        .queue-status-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .queue-status-dot { width: 6px; height: 6px; flex: 0 0 6px; background: var(--status-color); border-radius: 50%; box-shadow: 0 0 0 2px rgba(127,134,173,.13); }
+        .queue-status-detail { flex: 0 0 auto; color: #858db9; font-weight: 500; }
+        .queue-status-detail[hidden] { display: none; }
+        .queue-status-bar[data-tone="active"] { --status-color: rgb(112, 119, 194); color: #dfe2ff; }
+        .queue-status-bar[data-tone="active"] .queue-status-dot { animation: queue-status-pulse 1.5s ease-in-out infinite; box-shadow: 0 0 0 2px rgba(112,119,194,.18); }
+        .queue-status-bar[data-tone="retry"] { --status-color: #f1c56f; color: #ffe1a0; }
+        .queue-status-bar[data-tone="paused"] { --status-color: #ff7d8e; color: #ffc3cb; }
+        .queue-status-bar[data-tone="waiting"] { --status-color: rgb(112, 119, 194); color: #cfd3fa; }
+        @keyframes queue-status-pulse { 0%, 100% { opacity: .55; transform: scale(.85); } 50% { opacity: 1; transform: scale(1.15); } }
+        @media (prefers-reduced-motion: reduce) { .queue-status-bar[data-tone="active"] .queue-status-dot { animation: none; } }
         .tabs { display: grid; grid-template-columns: 1fr 1fr 1.15fr; gap: 6px; padding: 8px 10px 0; }
         .tabs button span { margin-left: 9px; }
         .tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
         .body { min-height: 140px; overflow: auto; padding: 8px 10px 10px; }
         .view[hidden] { display: none; }
-        .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-        .summary { color: #b8bddc; font-size: 12px; }
+        .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 8px; }
         .list { display: flex; flex-direction: column; gap: 8px; }
         .empty { padding: 28px 10px; color: #989fca; text-align: center; border: 1px dashed #3a406a; border-radius: 8px; }
         .job { padding: 9px; border: 1px solid #363d66; border-left: 3px solid #777fae; border-radius: 8px; background: #191d3a; }
@@ -3270,8 +3289,9 @@
           <div class="title">NAI Image Workbench</div>
           <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">队列禁用</button>
           <button class="settings" type="button">设置</button>
-          <button class="collapse" type="button" aria-label="折叠">—</button>
+          <button class="collapse" type="button" title="展开面板" aria-label="展开面板">+</button>
         </header>
+        <button class="queue-status-bar" type="button" data-tone="idle" title="展开并查看队列" aria-label="队列状态：队列空闲；点击查看队列"><span class="queue-status-main"><span class="queue-status-dot" aria-hidden="true"></span><span class="queue-status-label">队列空闲</span></span><span class="queue-status-detail" hidden></span></button>
         <nav class="tabs">
           <button type="button" data-tab="queue">队列<span class="queue-count">0</span></button>
           <button type="button" data-tab="finished">已结束<span class="finished-count">0</span></button>
@@ -3280,7 +3300,6 @@
         <div class="body">
           <div class="queue-view view">
             <div class="toolbar">
-              <span class="summary"></span>
               <button class="clear danger" type="button">全部删除</button>
             </div>
             <div class="list"></div>
@@ -3353,10 +3372,8 @@
       void setQueueControlEnabled(enabled);
     });
     shadow.querySelector('.settings-form').addEventListener('submit', (event) => void saveSettingsFromForm(event));
-    shadow.querySelector('.collapse').addEventListener('click', async () => {
-      await saveState({ collapsed: !cachedState.collapsed });
-      scheduleRefresh();
-    });
+    shadow.querySelector('.collapse').addEventListener('click', () => void togglePanelCollapsed());
+    shadow.querySelector('.queue-status-bar').addEventListener('click', () => void togglePanelCollapsed());
     shadow.querySelectorAll('[data-tab]').forEach((button) => {
       button.addEventListener('click', async () => {
         await saveState({ activeTab: button.dataset.tab });
@@ -3514,6 +3531,70 @@
       || !['running', 'capturing', 'paused'].includes(batch.status);
   }
 
+  function queueStatusBarState(queued, pendingSnapshots, queueControlEnabled) {
+    const runningJob = queued.find((job) => job.status === 'running');
+    const retryJob = queued.find((job) => job.status === 'retry_wait');
+    const waitingCount = queued.filter((job) => ['queued', 'retry_wait'].includes(job.status)).length
+      + pendingSnapshots.length;
+    const queueTotal = queued.length + pendingSnapshots.length;
+    const generationRunning = Boolean(cachedBusy) || Boolean(runningJob);
+    const status = (label, detail, title, tone) => ({ label, detail, title, tone });
+
+    if (generationRunning) {
+      if (!queueControlEnabled) {
+        return status(
+          '正在生成',
+          waitingCount ? `队列关闭 · 保留 ${waitingCount}` : '队列关闭',
+          `正在生成，等待队列已关闭${waitingCount ? `，另有 ${waitingCount} 项保留` : ''}`,
+          'active',
+        );
+      }
+      if (cachedState.paused) {
+        return status(
+          '正在生成',
+          waitingCount ? `后续暂停 · ${waitingCount}` : '后续已暂停',
+          `正在生成，后续队列已暂停${waitingCount ? `，另有 ${waitingCount} 项等待` : ''}`,
+          'active',
+        );
+      }
+      return status(
+        '正在生成',
+        waitingCount ? `等待 ${waitingCount}` : '',
+        waitingCount ? `正在生成，另有 ${waitingCount} 项等待` : '正在生成',
+        'active',
+      );
+    }
+
+    if (!queueControlEnabled) {
+      return status(
+        '队列已关闭',
+        queueTotal ? `保留 ${queueTotal}` : '',
+        queueTotal ? `等待队列已关闭，保留 ${queueTotal} 项` : '等待队列已关闭',
+        'disabled',
+      );
+    }
+    if (cachedState.paused) {
+      return status(
+        '队列已暂停',
+        queueTotal ? `剩余 ${queueTotal}` : '',
+        queueTotal ? `队列已暂停，剩余 ${queueTotal} 项` : '队列已暂停',
+        'paused',
+      );
+    }
+    if (retryJob) {
+      const seconds = Math.max(0, Math.ceil((Number(retryJob.retryAt || 0) - now()) / 1_000));
+      const laterCount = Math.max(0, queueTotal - 1);
+      return status(
+        `${seconds} 秒后重试`,
+        laterCount ? `后续 ${laterCount}` : '',
+        `当前任务将在 ${seconds} 秒后重试${laterCount ? `，后续还有 ${laterCount} 项` : ''}`,
+        'retry',
+      );
+    }
+    if (queueTotal) return status('等待执行', `共 ${queueTotal} 项`, `队列中有 ${queueTotal} 项等待`, 'waiting');
+    return status('队列空闲', '', '队列为空', 'idle');
+  }
+
   async function refreshUi() {
     cachedState = await loadState();
     cachedJobs = await getAllJobs();
@@ -3544,7 +3625,11 @@
       : '点击启用等待队列；与设置中的“启用等待队列”是同一个开关';
     const queueEnabledInput = shadow.querySelector('input[name="queueEnabled"]');
     if (queueEnabledInput) queueEnabledInput.checked = queueControlEnabled;
-    shadow.querySelector('.collapse').textContent = cachedState.collapsed ? '+' : '—';
+    const collapseButton = shadow.querySelector('.collapse');
+    const panelToggleAction = cachedState.collapsed ? '展开' : '折叠';
+    collapseButton.textContent = cachedState.collapsed ? '+' : '—';
+    collapseButton.title = `${panelToggleAction}面板`;
+    collapseButton.setAttribute('aria-label', `${panelToggleAction}面板`);
 
     const queued = queueJobs(cachedJobs).filter((job) => job.status !== 'deleted_pending');
     const finished = cachedJobs
@@ -3552,6 +3637,15 @@
       .sort((a, b) => Number(b.endedAt || 0) - Number(a.endedAt || 0));
     const pendingSnapshots = pendingSnapshotCaptures.filter((pending) => !pending.cancelled);
     const queueTotal = queued.length + pendingSnapshots.length;
+    const queueStatusState = queueStatusBarState(queued, pendingSnapshots, queueControlEnabled);
+    const queueStatusBar = shadow.querySelector('.queue-status-bar');
+    const queueStatusDetail = queueStatusBar.querySelector('.queue-status-detail');
+    queueStatusBar.dataset.tone = queueStatusState.tone;
+    queueStatusBar.title = `${queueStatusState.title}；点击${panelToggleAction}面板`;
+    queueStatusBar.setAttribute('aria-label', `队列状态：${queueStatusState.label}${queueStatusState.detail ? `，${queueStatusState.detail}` : ''}；点击${panelToggleAction}面板`);
+    queueStatusBar.querySelector('.queue-status-label').textContent = queueStatusState.label;
+    queueStatusDetail.textContent = queueStatusState.detail;
+    queueStatusDetail.hidden = !queueStatusState.detail;
     shadow.querySelector('.queue-count').textContent = String(queueTotal);
     shadow.querySelector('.finished-count').textContent = String(finished.length);
     shadow.querySelector('.batch-count').textContent = String(cachedState.batch.items.length + (cachedState.batch.current ? 1 : 0));
@@ -3562,11 +3656,6 @@
     renderBatchUi(cachedState.batch);
 
     const shown = cachedState.activeTab === 'finished' ? finished : [...pendingSnapshots, ...queued];
-    shadow.querySelector('.summary').textContent = cachedState.activeTab === 'finished'
-      ? `保留 ${finished.length}/${cachedState.settings.maxFinished}`
-      : !queueControlEnabled
-        ? `队列已禁用 · ${queueTotal} 项保留`
-        : `运行中 · ${queueTotal} 项`;
     const list = shadow.querySelector('.list');
     list.replaceChildren();
     if (!shown.length) {

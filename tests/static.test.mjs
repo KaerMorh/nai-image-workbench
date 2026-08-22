@@ -223,10 +223,31 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /input\[name="queueEnabled"\].*addEventListener\('change'/);
   assert.match(source, /与外部按钮功能相同/);
   assert.match(source, /<small class="settings-credit">by KaerMorh<\/small>/);
-  assert.match(source, /historySaveIndicator: true/);
+  assert.match(source, /historySaveIndicator: false/);
   assert.match(source, /toastDurationMs: 2_000/);
   assert.match(source, /\.tabs button span \{ margin-left: 9px; \}/);
   assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
+});
+
+test('keeps queue status in a permanent strip without crowding the header', () => {
+  assert.match(source, /<\/header>\s*<button class="queue-status-bar"/);
+  assert.match(source, /\.queue-status-bar \{[^}]*width: 100%;[^}]*min-height: 27px;/);
+  assert.match(source, /\.collapse \{[^}]*width: 30px;[^}]*min-width: 30px;[^}]*flex: 0 0 30px;/);
+  assert.match(source, /function queueStatusBarState\(queued, pendingSnapshots, queueControlEnabled\)/);
+  assert.match(source, /async function togglePanelCollapsed\(\)/);
+  assert.match(source, /collapsed: !cachedState\.collapsed/);
+  assert.match(source, /querySelector\('\.collapse'\)\.addEventListener\('click', \(\) => void togglePanelCollapsed\(\)\)/);
+  assert.match(source, /querySelector\('\.queue-status-bar'\)\.addEventListener\('click', \(\) => void togglePanelCollapsed\(\)\)/);
+  assert.match(source, /queueStatusBar\.querySelector\('\.queue-status-label'\)\.textContent/);
+  assert.match(source, /queueStatusDetail\.hidden = !queueStatusState\.detail/);
+  assert.match(source, /collapsed: true/);
+  assert.match(source, /panelToggleAction = cachedState\.collapsed \? '展开' : '折叠'/);
+  assert.match(source, /'正在生成'/);
+  assert.match(source, /'等待执行'/);
+  assert.match(source, /'队列已暂停'/);
+  assert.match(source, /'队列空闲'/);
+  assert.doesNotMatch(source, /queue-indicator/);
+  assert.doesNotMatch(source, /class="summary"/);
 });
 
 test('supports one named prompt placeholder and newline-separated replacement units', () => {
