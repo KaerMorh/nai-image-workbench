@@ -1214,7 +1214,7 @@
     return { selected, wantsGrid, atomSnapshot, generationApi };
   }
 
-  async function captureGenerationInvocation(preparedCallback, busyAccess, { force = false } = {}) {
+  async function captureGenerationInvocation(preparedCallback, busyAccess, { force = false, bridgeResult = false } = {}) {
     const methodName = preparedCallback.wantsGrid && typeof preparedCallback.generationApi.generateGrid === 'function'
       ? 'generateGrid'
       : 'generateNormal';
@@ -1226,7 +1226,11 @@
     if (typeof apiEntry.originalMethod !== 'function') return null;
     const pendingSets = [];
     let activated = false;
+    let dispatched = false;
     let captured = null;
+    // A queued capture must keep NovelAI's original high-level callback awaiting
+    // the eventual request result; otherwise its History update path exits early.
+    const resultBridge = bridgeResult ? createDeferred() : null;
     let resolveCaptured;
     const capturedPromise = new Promise((resolve) => { resolveCaptured = resolve; });
     const get = (atom) => {
@@ -1245,7 +1249,7 @@
         captured = { args, thisArg: this };
         resolveCaptured(captured);
       }
-      return undefined;
+      return resultBridge?.promise;
     };
     try {
       const returned = preparedCallback.wantsGrid
@@ -1261,16 +1265,73 @@
     } finally {
       apiEntry.api[apiEntry.methodName] = apiEntry.originalMethod;
     }
-    if (!captured) return null;
+    if (!captured) {
+      if (resultBridge && !resultBridge.settled) {
+        resultBridge.settled = true;
+        resultBridge.resolve(undefined);
+      }
+      return null;
+    }
     return {
       ...captured,
       originalMethod: apiEntry.originalMethod,
+      dispatch(args = captured.args) {
+        if (dispatched) throw new Error('Generation invocation has already been dispatched.');
+        dispatched = true;
+        let returned;
+        try {
+          returned = apiEntry.originalMethod.apply(captured.thisArg, args);
+        } catch (error) {
+          if (resultBridge && !resultBridge.settled) {
+            resultBridge.settled = true;
+            resultBridge.reject(error);
+          }
+          throw error;
+        }
+        if (resultBridge) {
+          Promise.resolve(returned).then(
+            (value) => {
+              if (resultBridge.settled) return;
+              resultBridge.settled = true;
+              resultBridge.resolve(value);
+            },
+            (error) => {
+              if (resultBridge.settled) return;
+              resultBridge.settled = true;
+              resultBridge.reject(error);
+            },
+          );
+        }
+        return returned;
+      },
+      cancel() {
+        if (dispatched || !resultBridge || resultBridge.settled) return;
+        resultBridge.settled = true;
+        resultBridge.resolve(undefined);
+      },
       activate() {
         if (activated) return;
         activated = true;
         for (const operation of pendingSets) busyAccess.store.set(operation.atom, ...operation.args);
       },
     };
+  }
+
+  function refreshInvocationRuntimeCallbacks(snapshot, fresh) {
+    // Preserve the queued parameter snapshot while using callbacks from the
+    // post-generation render that will receive the eventual queued response.
+    if (typeof snapshot === 'function') return typeof fresh === 'function' ? fresh : snapshot;
+    if (Array.isArray(snapshot)) {
+      return snapshot.map((value, index) => refreshInvocationRuntimeCallbacks(value, fresh?.[index]));
+    }
+    const isPlainObject = snapshot && typeof snapshot === 'object'
+      && (Object.getPrototypeOf(snapshot) === Object.prototype || Object.getPrototypeOf(snapshot) === null);
+    if (!isPlainObject) return snapshot;
+    const result = {};
+    for (const [key, value] of Object.entries(snapshot)) {
+      result[key] = refreshInvocationRuntimeCallbacks(value, fresh?.[key]);
+    }
+    return result;
   }
 
   function findGenerateButton() {
@@ -2270,7 +2331,7 @@
     const forceNewSeed = fixedSeed === null;
     const invocation = await (snapshotProbeChain = snapshotProbeChain
       .catch(() => undefined)
-      .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed })));
+      .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed, bridgeResult: true })));
     if (!invocation) {
       notify('无法完整读取当前配置，队列已暂停。', 'error');
       void saveState({ paused: true }).then(scheduleRefresh);
@@ -2289,6 +2350,7 @@
     if (fixedSeed !== null) {
       const predecessorFingerprint = await immediateDuplicateBaselineFingerprint();
       if (predecessorFingerprint && predecessorFingerprint === comparisonFingerprint) {
+        invocation.cancel();
         notify(DUPLICATE_ENQUEUE_MESSAGE, 'info');
         return;
       }
@@ -2315,6 +2377,7 @@
     };
     pendingSnapshotCaptures.push(pending);
     let session = null;
+    let activeInvocation = invocation;
     scheduleRefresh();
     updateGenerateClickOverlay();
     try {
@@ -2324,7 +2387,6 @@
         await refreshBusyCache();
       }
       if (pending.cancelled) return;
-      let activeInvocation = invocation;
       let activeBusyRelease = busyRelease;
       if (!cachedBusy) {
         const freshButton = findGenerateButton();
@@ -2334,9 +2396,16 @@
           ? prepareCurrentGenerationCallback(freshButton, freshBusyRelease, preparedCallback.wantsGrid)
           : null;
         const freshInvocation = freshPreparedCallback
-          ? await captureGenerationInvocation(freshPreparedCallback, freshBusyRelease, { force: forceNewSeed })
+          ? await (snapshotProbeChain = snapshotProbeChain
+            .catch(() => undefined)
+            .then(() => captureGenerationInvocation(
+              freshPreparedCallback,
+              freshBusyRelease,
+              { force: forceNewSeed, bridgeResult: true },
+            )))
           : null;
         if (freshInvocation) {
+          invocation.cancel();
           activeInvocation = freshInvocation;
           activeBusyRelease = freshBusyRelease;
         }
@@ -2351,7 +2420,10 @@
       let returned;
       let validationPassed;
       try {
-        returned = activeInvocation.originalMethod.apply(activeInvocation.thisArg, invocationArgs);
+        const activeInvocationArgs = activeInvocation === invocation
+          ? invocationArgs
+          : refreshInvocationRuntimeCallbacks(invocationArgs, activeInvocation.args);
+        returned = activeInvocation.dispatch(activeInvocationArgs);
         if (returned && typeof returned.catch === 'function') returned.catch(() => undefined);
         validationPassed = await waitForCaptureSession(session, 1_500);
       } finally {
@@ -2375,6 +2447,8 @@
       if (session) discardCaptureSession(session);
       notify(`NovelAI 参数校验未完成：${error.message || error}`, 'error');
     } finally {
+      invocation.cancel();
+      if (activeInvocation !== invocation) activeInvocation.cancel();
       pending.cancelled = true;
       const pendingIndex = pendingSnapshotCaptures.indexOf(pending);
       if (pendingIndex >= 0) pendingSnapshotCaptures.splice(pendingIndex, 1);

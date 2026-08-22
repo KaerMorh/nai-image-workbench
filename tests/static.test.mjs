@@ -88,15 +88,17 @@ test('captures current React generation parameters without sending in parallel',
   assert.match(source, /source\.includes\('gridXLength'\) && source\.includes\('gridYLength'\)/);
   assert.match(source, /captureLowLevelGeneration/);
   assert.match(source, /pendingSnapshotCaptures/);
-  assert.match(source, /activeInvocation\.originalMethod\.apply\(activeInvocation\.thisArg, invocationArgs\)/);
+  assert.match(source, /activeInvocation\.dispatch\(activeInvocationArgs\)/);
   assert.match(source, /activation: activeInvocation\.activate/);
   assert.match(source, /const fixedSeed = readNativeFixedSeed\(\);\s*const forceNewSeed = fixedSeed === null/);
-  assert.match(source, /captureGenerationInvocation\(preparedCallback, busyRelease, \{ force: forceNewSeed \}\)/);
+  assert.match(source, /captureGenerationInvocation\(preparedCallback, busyRelease, \{ force: forceNewSeed, bridgeResult: true \}\)/);
   assert.match(source, /function createUnfixedImageSeed\(\)/);
   assert.match(source, /if \(forceNewSeed\) \{\s*const invocationOptions = invocationArgs\[0\] \|\| \{};/);
   assert.match(source, /seed: createUnfixedImageSeed\(\)/);
   assert.match(source, /if \(wasNovelAIBusy\) activeBusyRelease\.store\.set\(activeBusyRelease\.atom, false\)/);
-  assert.match(source, /returned = activeInvocation\.originalMethod\.apply\(activeInvocation\.thisArg, invocationArgs\)/);
+  assert.match(source, /returned = activeInvocation\.dispatch\(activeInvocationArgs\)/);
+  assert.match(source, /refreshInvocationRuntimeCallbacks\(invocationArgs, activeInvocation\.args\)/);
+  assert.match(source, /snapshotProbeChain = snapshotProbeChain\s*\.catch\(\(\) => undefined\)\s*\.then\(\(\) => captureGenerationInvocation\(\s*freshPreparedCallback/);
 });
 
 test('parses multipart request JSON and preserves NovelAI request seeds across retries', () => {
@@ -149,11 +151,20 @@ test('captures a fixed-seed direct generation fingerprint while dispatching exac
   assert.match(source, /rememberDirectGenerationFingerprint/);
   assert.match(source, /event\.isTrusted/);
   assert.match(source, /event\.stopImmediatePropagation\(\)/);
-  assert.match(source, /invocation\.originalMethod\.apply\(invocation\.thisArg, invocation\.args\)/);
+  assert.match(source, /const returned = invocation\.originalMethod\.apply\(invocation\.thisArg, invocation\.args\)/);
   assert.match(source, /replayingDirectGenerateClick/);
   assert.match(source, /pendingDirectComparisonCapture/);
   assert.match(source, /activeDirectComparisonFingerprintPromise/);
   assert.match(source, /comparisonFingerprint/);
+});
+
+test('keeps the NovelAI generation promise alive so queued results reach History', () => {
+  assert.match(source, /bridgeResult = false/);
+  assert.match(source, /return resultBridge\?\.promise/);
+  assert.match(source, /Promise\.resolve\(returned\)\.then/);
+  assert.match(source, /resultBridge\.resolve\(value\)/);
+  assert.match(source, /if \(dispatched \|\| !resultBridge \|\| resultBridge\.settled\) return/);
+  assert.match(source, /invocation\.cancel\(\)/);
 });
 
 test('allows every toast to be dismissed directly', () => {
