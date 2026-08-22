@@ -1,6 +1,6 @@
 {
   "name": "nai-image-workbench",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "scripts": {
     "test": "node --check nai-image-workbench.user.js && node --test tests/static.test.mjs"

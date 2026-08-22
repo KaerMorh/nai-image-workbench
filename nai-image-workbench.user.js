@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.2
+// @version      0.6.3
 // @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/image*
@@ -17,7 +17,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.2';
+  const SCRIPT_VERSION = '0.6.3';
   const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
@@ -94,8 +94,8 @@
         interJobDelayMs: INTER_JOB_DELAY_MS,
         maxFinished: MAX_FINISHED,
         toastDurationMs: 4_000,
-        toastPosition: 'bottom-right',
-        historySaveIndicator: false,
+        toastPosition: 'top-right',
+        historySaveIndicator: true,
       },
     };
   }
@@ -152,7 +152,7 @@
   function normalizeQueueSettings(value = {}) {
     const toastPosition = ['bottom-right', 'top-right', 'off'].includes(value.toastPosition)
       ? value.toastPosition
-      : 'bottom-right';
+      : 'top-right';
     return {
       queueEnabled: value.queueEnabled !== false,
       maxRetries: Math.round(clampNumber(value.maxRetries, 0, QUEUE_RETRY_DELAYS_MS.length, QUEUE_RETRY_DELAYS_MS.length)),
@@ -160,7 +160,7 @@
       maxFinished: Math.round(clampNumber(value.maxFinished, 10, MAX_FINISHED, MAX_FINISHED)),
       toastDurationMs: Math.round(clampNumber(value.toastDurationMs, 1_000, 30_000, 4_000)),
       toastPosition,
-      historySaveIndicator: value.historySaveIndicator === true,
+      historySaveIndicator: value.historySaveIndicator !== false,
     };
   }
 
@@ -2151,7 +2151,7 @@
       return;
     }
     if (state.paused) {
-      notify('普通队列目前处于暂停状态，请先点击工具盒顶部“继续”。', 'error');
+      notify('等待队列目前未启用，请点击面板顶部“队列启用”。', 'error');
       return;
     }
     try {
@@ -2547,13 +2547,29 @@
     void garbageCollectBlobs();
   }
 
-  async function togglePaused() {
-    const next = !cachedState.paused;
-    await saveState({ paused: next });
-    notify(next ? '队列已暂停。当前任务不会被取消。' : '队列已继续。', next ? 'info' : 'success');
+  function isQueueControlEnabled(state = cachedState) {
+    return Boolean(state?.settings?.queueEnabled) && !state?.paused;
+  }
+
+  async function setQueueControlEnabled(enabled, { showNotice = true } = {}) {
+    const state = await loadState();
+    const settings = normalizeQueueSettings({ ...state.settings, queueEnabled: Boolean(enabled) });
+    await saveState({ settings, paused: false });
+    if (showNotice) {
+      notify(enabled
+        ? '等待队列已启用。'
+        : '等待队列已禁用。当前任务不会被取消，现有任务会保留。', enabled ? 'success' : 'info');
+    }
     scheduleRefresh();
-    if (!next) kickScheduler();
-    if (!next) void drainSnapshotCaptures();
+    if (enabled) {
+      kickScheduler();
+      void drainSnapshotCaptures();
+    }
+  }
+
+  async function toggleQueueControl() {
+    const state = await loadState();
+    await setQueueControlEnabled(!isQueueControlEnabled(state));
   }
 
   async function saveBatchItemsFromTextarea() {
@@ -2690,10 +2706,10 @@
     scheduleRefresh();
   }
 
-  function fillSettingsForm(settings = cachedState.settings) {
+  function fillSettingsForm(settings = cachedState.settings, queueEnabled = isQueueControlEnabled(cachedState)) {
     if (!shadow) return;
     const form = shadow.querySelector('.settings-form');
-    form.elements.queueEnabled.checked = settings.queueEnabled;
+    form.elements.queueEnabled.checked = queueEnabled;
     form.elements.maxRetries.value = String(settings.maxRetries);
     form.elements.interJobDelaySeconds.value = String(settings.interJobDelayMs / 1_000);
     form.elements.maxFinished.value = String(settings.maxFinished);
@@ -2741,10 +2757,10 @@
       toastPosition: form.elements.toastPosition.value,
       historySaveIndicator: form.elements.historySaveIndicator.checked,
     });
-    await saveState({ settings });
+    await saveState({ settings, paused: false });
     await trimFinishedJobs();
     closeSettings();
-    notify(settings.queueEnabled ? '设置已保存，队列功能已启用。' : '设置已保存，队列功能已关闭。现有任务会保留。', 'success');
+    notify(settings.queueEnabled ? '设置已保存，等待队列已启用。' : '设置已保存，等待队列已禁用。现有任务会保留。', 'success');
     scheduleRefresh();
     scheduleHistorySaveIndicatorUpdate();
     if (settings.queueEnabled) {
@@ -2763,7 +2779,6 @@
         :host { all: initial; }
         * { box-sizing: border-box; }
         .panel { position: fixed; top: 112px; right: 16px; z-index: 2147483000; width: 380px; max-width: calc(100vw - 24px); max-height: min(72vh, 760px); display: flex; flex-direction: column; color: #fff; background: #141936; border: 1px solid #343a63; border-radius: 10px; box-shadow: 0 14px 42px rgba(0,0,0,.45); font: 14px/1.4 "Source Sans Pro", system-ui, sans-serif; overflow: hidden; }
-        .panel.collapsed { width: 220px; }
         .panel.collapsed .body, .panel.collapsed .tabs { display: none; }
         .header { display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: #191b31; border-bottom: 1px solid #343a63; cursor: move; user-select: none; }
         .title { min-width: 0; flex: 1; font: 600 15px/1.2 Eczar, system-ui, sans-serif; color: #f5f3c2; }
@@ -2820,6 +2835,9 @@
         .settings-dialog[hidden] { display: none; }
         .settings-title { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; color: #f5f3c2; background: #191b31; border-bottom: 1px solid #343a63; font-size: 15px; font-weight: 700; cursor: move; user-select: none; }
         .settings-form { max-height: calc(100vh - 78px); overflow-y: auto; padding: 10px 12px 12px; }
+        .setting-group { min-width: 0; margin: 0 0 10px; padding: 3px 10px 2px; border: 1px solid rgba(74,82,126,.7); border-radius: 8px; }
+        .setting-group legend { padding: 0 6px; color: #f5f3c2; font-size: 12px; font-weight: 700; }
+        .setting-group:last-of-type { margin-bottom: 0; }
         .setting-row { display: grid; grid-template-columns: minmax(0, 1fr) 112px; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid rgba(74,82,126,.45); }
         .setting-row:last-of-type { border-bottom: 0; }
         .setting-row small { display: block; margin-top: 2px; color: #979fc9; font-size: 11px; }
@@ -2836,7 +2854,7 @@
       <section class="panel" aria-label="NAI Image Workbench 队列">
         <header class="header">
           <div class="title">NAI Image Workbench</div>
-          <button class="pause primary" type="button">暂停</button>
+          <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">队列禁用</button>
           <button class="settings" type="button">设置</button>
           <button class="collapse" type="button" aria-label="折叠">—</button>
         </header>
@@ -2880,16 +2898,22 @@
           </div>
         </div>
       </section>
-      <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="队列设置" hidden>
-        <div class="settings-title"><span>队列设置</span><button class="settings-close" type="button" aria-label="关闭设置">×</button></div>
+      <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="设置" hidden>
+        <div class="settings-title"><span>设置</span><button class="settings-close" type="button" aria-label="关闭设置">×</button></div>
         <form class="settings-form">
-          <label class="setting-row"><span>启用等待队列<small>关闭后不接管 Generate，也不派发后续任务</small></span><input name="queueEnabled" type="checkbox"></label>
-          <label class="setting-row"><span>自动重试次数<small>只用于 429 与连接失败，范围 0–3</small></span><input name="maxRetries" type="number" min="0" max="3" step="1"></label>
-          <label class="setting-row"><span>任务间隔（秒）<small>前一任务完成后再等待，范围 0.5–10</small></span><input name="interJobDelaySeconds" type="number" min="0.5" max="10" step="0.5"></label>
-          <label class="setting-row"><span>已结束记录上限<small>超出后自动删除最旧记录，范围 10–100</small></span><input name="maxFinished" type="number" min="10" max="100" step="1"></label>
-          <label class="setting-row"><span>提示位置<small>可放在右下角、右上角，或完全关闭</small></span><select name="toastPosition"><option value="bottom-right">右下角</option><option value="top-right">右上角</option><option value="off">关闭</option></select></label>
-          <label class="setting-row"><span>普通提示停留（秒）<small>点击提示仍可立即关闭，范围 1–30</small></span><input name="toastDurationSeconds" type="number" min="1" max="30" step="1"></label>
-          <label class="setting-row"><span>History 保存状态标识<small>缩略图右下角：已保存为绿色，未保存及生成中为红色</small></span><input name="historySaveIndicator" type="checkbox"></label>
+          <fieldset class="setting-group">
+            <legend>队列设置</legend>
+            <label class="setting-row" title="与面板顶部的“队列启用 / 队列禁用”按钮功能相同；修改后立即生效"><span>启用等待队列<small>与外部按钮功能相同；关闭后不接管 Generate，也不派发后续任务</small></span><input name="queueEnabled" type="checkbox"></label>
+            <label class="setting-row"><span>自动重试次数<small>只用于 429 与连接失败，范围 0–3</small></span><input name="maxRetries" type="number" min="0" max="3" step="1"></label>
+            <label class="setting-row"><span>任务间隔（秒）<small>前一任务完成后再等待，范围 0.5–10</small></span><input name="interJobDelaySeconds" type="number" min="0.5" max="10" step="0.5"></label>
+            <label class="setting-row"><span>已结束记录上限<small>超出后自动删除最旧记录，范围 10–100</small></span><input name="maxFinished" type="number" min="10" max="100" step="1"></label>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>使用体验</legend>
+            <label class="setting-row"><span>提示位置<small>可放在右上角、右下角，或完全关闭</small></span><select name="toastPosition"><option value="top-right">右上角</option><option value="bottom-right">右下角</option><option value="off">关闭</option></select></label>
+            <label class="setting-row"><span>普通提示停留（秒）<small>点击提示仍可立即关闭，范围 1–30</small></span><input name="toastDurationSeconds" type="number" min="1" max="30" step="1"></label>
+            <label class="setting-row"><span>History 保存状态标识<small>缩略图右下角：已保存为绿色，未保存及生成中为红色</small></span><input name="historySaveIndicator" type="checkbox"></label>
+          </fieldset>
           <div class="settings-actions">
             <button class="settings-reset" type="button">恢复默认</button>
             <button class="settings-cancel" type="button">取消</button>
@@ -2902,11 +2926,15 @@
     `;
     document.documentElement.append(uiHost);
 
-    shadow.querySelector('.pause').addEventListener('click', () => void togglePaused());
+    shadow.querySelector('.queue-toggle').addEventListener('click', () => void toggleQueueControl());
     shadow.querySelector('.settings').addEventListener('click', openSettings);
     shadow.querySelector('.settings-close').addEventListener('click', closeSettings);
     shadow.querySelector('.settings-cancel').addEventListener('click', closeSettings);
-    shadow.querySelector('.settings-reset').addEventListener('click', () => fillSettingsForm(defaultState().settings));
+    shadow.querySelector('.settings-reset').addEventListener('click', () => fillSettingsForm(defaultState().settings, true));
+    shadow.querySelector('input[name="queueEnabled"]').addEventListener('change', (event) => {
+      const enabled = event.currentTarget.checked;
+      void setQueueControlEnabled(enabled);
+    });
     shadow.querySelector('.settings-form').addEventListener('submit', (event) => void saveSettingsFromForm(event));
     shadow.querySelector('.collapse').addEventListener('click', async () => {
       await saveState({ collapsed: !cachedState.collapsed });
@@ -3090,8 +3118,15 @@
       settingsDialog.style.top = cachedState.settingsPosition.top;
       settingsDialog.style.right = 'auto';
     }
-    shadow.querySelector('.pause').textContent = cachedState.paused ? '继续' : '暂停';
-    shadow.querySelector('.pause').classList.toggle('primary', cachedState.paused);
+    const queueControlEnabled = isQueueControlEnabled(cachedState);
+    const queueControl = shadow.querySelector('.queue-toggle');
+    queueControl.textContent = queueControlEnabled ? '队列禁用' : '队列启用';
+    queueControl.classList.toggle('primary', !queueControlEnabled);
+    queueControl.title = queueControlEnabled
+      ? '点击禁用等待队列；与设置中的“启用等待队列”是同一个开关'
+      : '点击启用等待队列；与设置中的“启用等待队列”是同一个开关';
+    const queueEnabledInput = shadow.querySelector('input[name="queueEnabled"]');
+    if (queueEnabledInput) queueEnabledInput.checked = queueControlEnabled;
     shadow.querySelector('.collapse').textContent = cachedState.collapsed ? '+' : '—';
 
     const queued = queueJobs(cachedJobs).filter((job) => job.status !== 'deleted_pending');
@@ -3112,9 +3147,9 @@
     const shown = cachedState.activeTab === 'finished' ? finished : [...pendingSnapshots, ...queued];
     shadow.querySelector('.summary').textContent = cachedState.activeTab === 'finished'
       ? `保留 ${finished.length}/${cachedState.settings.maxFinished}`
-      : !cachedState.settings.queueEnabled
-        ? `队列已关闭 · ${queueTotal} 项保留`
-        : cachedState.paused ? `已暂停 · ${queueTotal} 项` : `运行中 · ${queueTotal} 项`;
+      : !queueControlEnabled
+        ? `队列已禁用 · ${queueTotal} 项保留`
+        : `运行中 · ${queueTotal} 项`;
     const list = shadow.querySelector('.list');
     list.replaceChildren();
     if (!shown.length) {

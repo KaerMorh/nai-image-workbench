@@ -80,7 +80,7 @@ test('allows every toast to be dismissed directly', () => {
 });
 
 test('supports bottom-right, top-right, or disabled workbench notifications', () => {
-  assert.match(source, /toastPosition: 'bottom-right'/);
+  assert.match(source, /toastPosition: 'top-right'/);
   assert.match(source, /\['bottom-right', 'top-right', 'off'\]/);
   assert.match(source, /data-position="top-right"/);
   assert.match(source, /cachedState\.settings\.toastPosition === 'off'/);
@@ -121,6 +121,15 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /!state\.settings\.queueEnabled/);
   assert.match(source, /settingsPosition/);
   assert.match(source, /settingsHeader\.addEventListener\('pointermove'/);
+  assert.match(source, /<legend>队列设置<\/legend>/);
+  assert.match(source, /<legend>使用体验<\/legend>/);
+  assert.match(source, /队列禁用/);
+  assert.match(source, /队列启用/);
+  assert.match(source, /toggleQueueControl/);
+  assert.match(source, /input\[name="queueEnabled"\].*addEventListener\('change'/);
+  assert.match(source, /与外部按钮功能相同/);
+  assert.match(source, /historySaveIndicator: true/);
+  assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
 });
 
 test('supports one named prompt placeholder and newline-separated replacement units', () => {
