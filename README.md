@@ -2,8 +2,7 @@
 
 NovelAI 生成一张图要等，等完才能点下一张。NAI Image Workbench 让你在生成过程中继续点击 Generate，把当时的配置排进队列，跑完再回来收图。
 
-
-<!-- 图片预留：docs/images/queue-demo.gif -->
+![NAI Image Workbench 界面总览](docs/images/workbench-overview.jpg)
 
 ## 等待队列
 
