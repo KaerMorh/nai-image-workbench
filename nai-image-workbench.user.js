@@ -3181,9 +3181,8 @@
         .settings-credit { margin-left: 10px; color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
         .settings-actions { display: flex; justify-content: flex-end; gap: 7px; }
         .generate-hitbox { position: fixed; z-index: 2147482500; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 4px 8px 4px 12px; border: 0; border-radius: 4px; color: rgb(19, 21, 44); background: transparent !important; box-shadow: none; cursor: pointer; font: 700 16px/24px "Source Sans Pro", system-ui, sans-serif; text-align: left; pointer-events: auto; }
-        .generate-hitbox[data-mode="queue"] { background: rgb(245, 243, 194) !important; }
-        .generate-hitbox[data-mode="queue"]:hover { background: rgb(255, 253, 207) !important; }
-        .generate-hitbox-label { color: rgb(112, 119, 194); }
+        .generate-hitbox[data-mode="queue"] { background: rgb(112, 119, 194) !important; }
+        .generate-hitbox[data-mode="queue"]:hover { background: rgb(126, 133, 207) !important; }
         .generate-hitbox-cost { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 4px; color: rgb(245, 243, 194); background: rgb(19, 21, 44); }
         .generate-hitbox-cost[hidden] { display: none; }
         .generate-hitbox-cost-value { min-width: 20px; text-align: center; }
