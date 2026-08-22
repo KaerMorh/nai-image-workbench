@@ -3183,10 +3183,10 @@
         .generate-hitbox { position: fixed; z-index: 2147482500; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 4px 8px 4px 12px; border: 0; border-radius: 4px; color: rgb(19, 21, 44); background: transparent !important; box-shadow: none; cursor: pointer; font: 700 16px/24px "Source Sans Pro", system-ui, sans-serif; text-align: left; pointer-events: auto; }
         .generate-hitbox[data-mode="queue"] { background: rgb(112, 119, 194) !important; }
         .generate-hitbox[data-mode="queue"]:hover { background: rgb(126, 133, 207) !important; }
-        .generate-hitbox-cost { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 4px; color: rgb(245, 243, 194); background: rgb(19, 21, 44); }
+        .generate-hitbox-cost { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 4px; color: rgb(112, 119, 194); background: rgb(19, 21, 44); }
         .generate-hitbox-cost[hidden] { display: none; }
         .generate-hitbox-cost-value { min-width: 20px; text-align: center; }
-        .generate-hitbox-cost-icon { width: 10px; height: 10px; flex: 0 0 10px; background: rgb(245, 243, 194); mask-position: center; mask-repeat: no-repeat; mask-size: contain; }
+        .generate-hitbox-cost-icon { width: 10px; height: 10px; flex: 0 0 10px; background: rgb(112, 119, 194); mask-position: center; mask-repeat: no-repeat; mask-size: contain; }
         .generate-hitbox[data-paused="true"] { cursor: not-allowed; }
         .generate-hitbox[hidden] { display: none; }
         @media (max-width: 700px) { .panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 64vh; } }

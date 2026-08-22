@@ -54,6 +54,8 @@ test('matches the NovelAI generate button and restores NovelAI disabled state fo
   assert.doesNotMatch(source, /\.generate-hitbox-label \{[^}]*color:/);
   assert.match(source, /\.generate-hitbox \{[^}]*color: rgb\(19, 21, 44\)/);
   assert.match(source, /class="generate-hitbox-cost"/);
+  assert.match(source, /\.generate-hitbox-cost \{[^}]*color: rgb\(112, 119, 194\);[^}]*background: rgb\(19, 21, 44\);/);
+  assert.match(source, /\.generate-hitbox-cost-icon \{[^}]*background: rgb\(112, 119, 194\);/);
   assert.match(source, /label\.textContent = queueMode \? '加入队列'/);
   assert.match(source, /capturedPrice: extractCapturedPrice\(target\.innerText\)/);
   assert.match(source, /pending\.capturedPrice.*Anlas/);
