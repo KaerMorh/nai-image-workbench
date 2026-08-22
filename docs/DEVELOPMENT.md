@@ -10,10 +10,11 @@
 
 ## 本地加载
 
-1. 在 Tampermonkey 中安装一次 `nai-image-workbench.dev.user.js`。
-2. 停用正式安装的脚本副本，避免重复加载。
-3. 修改 `nai-image-workbench.user.js`。
-4. 手动刷新测试页面以载入最新源码。
+1. 运行 `npm run dev`，启动只监听 `127.0.0.1:8765` 的本地开发服务。
+2. 打开 `http://127.0.0.1:8765/nai-image-workbench.dev.user.js`，在 Tampermonkey 中安装一次开发加载器。
+3. 在 Tampermonkey 的扩展设置中允许访问本地文件，并停用正式安装的脚本副本，避免重复加载。
+4. 修改 `nai-image-workbench.user.js`。
+5. 手动刷新测试页面以载入最新源码。
 
 开发加载器通过本地 `@require` 读取源码，不需要每次重新安装。
 
@@ -31,7 +32,7 @@ npm test
 - 不加载外部代码或使用特权 Userscript API
 - 不并行派发生成请求
 - 保留原始响应处理和 History 更新流程
-- 队列重试、随机 Seed 和记录上限
+- 队列重试、Seed 原样保留和记录上限
 - Prompt 占位符、冻结请求和批次恢复规则
 - History 状态标识不拦截指针事件
 
@@ -47,11 +48,11 @@ BroadcastChannel 负责状态通知，Web Locks 负责执行排他。多个页�
 
 ### 请求捕获
 
-脚本在用户动作产生生成请求时保存完整配置。运行任务时仍然让 NovelAI 原始代码处理响应、主画面和 History。
+点击入队时，脚本立即调用 NovelAI 原始生成函数，并在 `fetch` 层截住通过校验的请求；没有请求就不创建任务。Seed 不由工具生成或改写，运行任务时仍然让 NovelAI 原始代码处理响应、主画面和 History。
 
 ### 批量替换
 
-批量模式冻结一份完整请求模板，只替换 Base Prompt 中指定的占位符。每次发送前重新生成随机 Seed。
+批量模式冻结一份完整请求模板，只替换 Base Prompt 中指定的占位符；包括 Seed 在内的其他参数保持不变。
 
 ### History 状态
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.3
+// @version      0.6.4
 // @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/image*
@@ -17,7 +17,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.3';
+  const SCRIPT_VERSION = '0.6.4';
   const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
@@ -62,7 +62,6 @@
   let cachedState = defaultState();
   let cachedBusy = null;
   let idleJotaiBooleanAtoms = [];
-  let snapshotDrainRunning = false;
   let snapshotProbeChain = Promise.resolve();
   let captureSequence = 0;
   const captureSessions = [];
@@ -261,23 +260,6 @@
       return rect.width > 0 && rect.height > 0;
     });
     return String(editors[0]?.innerText || editors[0]?.textContent || '').trim();
-  }
-
-  function randomSeed() {
-    const value = new Uint32Array(1);
-    crypto.getRandomValues(value);
-    return value[0] || 1;
-  }
-
-  function withRandomSeed(bodyText) {
-    const multipart = splitMultipartRequestJson(bodyText);
-    const payload = safeJsonParse(bodyText) || multipart?.payload;
-    if (!payload || typeof payload !== 'object') return bodyText;
-    const seeded = structuredClone(payload);
-    if (seeded.parameters && typeof seeded.parameters === 'object') seeded.parameters.seed = randomSeed();
-    else seeded.seed = randomSeed();
-    const serialized = JSON.stringify(seeded);
-    return multipart ? `${multipart.beforeJson}${serialized}${multipart.afterJson}` : serialized;
   }
 
   function normalizeWhitespace(value) {
@@ -1101,20 +1083,6 @@
     return { selected, wantsGrid, atomSnapshot, generationApi };
   }
 
-  function findGenerationApi(button, wantsGrid) {
-    const fiber = findGenerationComponentFiber(button);
-    let hook = fiber?.memoizedState;
-    for (let index = 0; hook && index < 260; index += 1, hook = hook.next) {
-      const value = Array.isArray(hook.memoizedState) ? hook.memoizedState[0] : hook.memoizedState;
-      if (!value || typeof value !== 'object') continue;
-      const methodName = wantsGrid && typeof value.generateGrid === 'function'
-        ? 'generateGrid'
-        : typeof value.generateNormal === 'function' ? 'generateNormal' : null;
-      if (methodName) return { api: value, methodName, originalMethod: value[methodName] };
-    }
-    return null;
-  }
-
   async function captureGenerationInvocation(preparedCallback, busyAccess) {
     const methodName = preparedCallback.wantsGrid && typeof preparedCallback.generationApi.generateGrid === 'function'
       ? 'generateGrid'
@@ -1179,11 +1147,14 @@
   }
 
   function createCaptureSession(type, details = {}) {
+    let resolveCapture;
     const session = {
       id: `${TAB_ID}:${++captureSequence}`,
       type,
       createdAt: now(),
       consumed: false,
+      capturePromise: new Promise((resolve) => { resolveCapture = resolve; }),
+      resolveCapture,
       ...details,
     };
     captureSessions.push(session);
@@ -1191,6 +1162,9 @@
       const index = captureSessions.indexOf(session);
       if (index >= 0) captureSessions.splice(index, 1);
       if (!session.consumed) {
+        session.expired = true;
+        session.resolveCapture(false);
+        if (session.type === 'enqueue') return;
         if (session.type === 'batch-start' || session.type === 'batch-refresh') {
           void loadState().then((state) => saveState({
             batch: normalizeBatchState({
@@ -1215,8 +1189,16 @@
     const session = captureSessions.shift();
     if (!session) return null;
     session.consumed = true;
+    session.resolveCapture(true);
     nativeClearTimeout(session.cleanupTimer);
     return session;
+  }
+
+  function discardCaptureSession(session) {
+    const index = captureSessions.indexOf(session);
+    if (index >= 0) captureSessions.splice(index, 1);
+    nativeClearTimeout(session.cleanupTimer);
+    if (!session.consumed) session.resolveCapture(false);
   }
 
   function invokeNovelAIOnClick(button, event, session) {
@@ -1311,7 +1293,13 @@
   async function addCapturedJob(prepared, captureSession, deferred) {
     const job = await buildStoredJobFromPrepared(prepared, { costText: captureSession.costText });
     const fingerprint = await requestFingerprint(prepared);
-    runtimeJobs.set(job.id, { prepared, deferred, fingerprint, capturedAt: now() });
+    runtimeJobs.set(job.id, {
+      prepared,
+      deferred,
+      fingerprint,
+      capturedAt: now(),
+      activation: captureSession.activation || null,
+    });
     await putJob(job);
     notify('已加入队列。', 'success');
     notifyPeers('kick');
@@ -1424,8 +1412,7 @@
     const retryDelays = QUEUE_RETRY_DELAYS_MS.slice(0, state.settings.maxRetries);
     while (true) {
       try {
-        const attemptPrepared = { ...prepared, body: withRandomSeed(prepared.body) };
-        const response = await fetchWithTimeout(attemptPrepared, execution);
+        const response = await fetchWithTimeout(prepared, execution);
         if (response.status !== 429 || retryIndex >= retryDelays.length) return response;
         const retryAfterHeader = Number(response.headers.get('retry-after'));
         const delay = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
@@ -1644,6 +1631,10 @@
     const execution = createExecution(job, runtime);
     currentExecution = execution;
     await beginBusy('queue', job.id);
+    if (runtime.activation) {
+      runtime.activation();
+      runtime.activation = null;
+    }
     await updateJob(job.id, (current) => ({
       ...current,
       status: 'running',
@@ -1940,17 +1931,6 @@
       : '点击会把当前配置加入 NAI Image Workbench 队列';
   }
 
-  async function waitForNovelAIIdle(busyAccess, timeoutMs = GENERATION_TIMEOUT_MS) {
-    const startedAt = now();
-    while (now() - startedAt < timeoutMs) {
-      const button = findGenerateButton();
-      await refreshBusyCache();
-      if (!cachedBusy && button && !button.disabled) return true;
-      await new Promise((resolve) => nativeSetTimeout(resolve, 200));
-    }
-    return false;
-  }
-
   async function waitForCaptureSession(session, timeoutMs = 15_000) {
     const startedAt = now();
     while (now() - startedAt < timeoutMs) {
@@ -1958,56 +1938,6 @@
       await new Promise((resolve) => nativeSetTimeout(resolve, 50));
     }
     return false;
-  }
-
-  async function drainSnapshotCaptures() {
-    if (snapshotDrainRunning) return;
-    snapshotDrainRunning = true;
-    try {
-      while (pendingSnapshotCaptures.length) {
-        const pending = pendingSnapshotCaptures[0];
-        let state = await loadState();
-        while (state.paused || !state.settings.queueEnabled) {
-          await new Promise((resolve) => nativeSetTimeout(resolve, 250));
-          state = await loadState();
-        }
-        if (!(await waitForNovelAIIdle(pending.busyAccess))) {
-          notify('等待 NovelAI 当前任务结束超时，队列已暂停。', 'error');
-          await saveState({ paused: true });
-          scheduleRefresh();
-          return;
-        }
-        if (pending.cancelled || !pendingSnapshotCaptures.includes(pending)) {
-          pendingSnapshotCaptures.shift();
-          scheduleRefresh();
-          continue;
-        }
-        const session = createCaptureSession('enqueue', { costText: pending.costText });
-        try {
-          const liveApi = findGenerationApi(findGenerateButton(), pending.wantsGrid);
-          if (!liveApi) throw new Error('Current NovelAI generation API is unavailable.');
-          pending.invocation.activate();
-          const returned = liveApi.originalMethod.apply(liveApi.api, pending.invocation.args);
-          if (returned && typeof returned.catch === 'function') {
-            returned.catch((error) => console.error('[NAI Image Workbench] Deferred generation capture failed:', error));
-          }
-        } catch (error) {
-          const index = captureSessions.indexOf(session);
-          if (index >= 0) captureSessions.splice(index, 1);
-          nativeClearTimeout(session.cleanupTimer);
-          notify('无法生成队列请求，队列已暂停。', 'error');
-          await saveState({ paused: true });
-          scheduleRefresh();
-          return;
-        }
-        if (!(await waitForCaptureSession(session))) return;
-        pendingSnapshotCaptures.shift();
-        scheduleRefresh();
-      }
-    } finally {
-      snapshotDrainRunning = false;
-      updateGenerateClickOverlay();
-    }
   }
 
   async function onGenerateOverlayClick(event) {
@@ -2047,7 +1977,7 @@
       return;
     }
     const options = invocation.args[0] || {};
-    pendingSnapshotCaptures.push({
+    const pending = {
       id: crypto.randomUUID(),
       createdAt: now(),
       invocation,
@@ -2064,11 +1994,36 @@
         options.referenceImages?.length ? { label: 'Vibe/参考', count: options.referenceImages.length } : null,
         options.characterReferences?.length ? { label: '角色参考', count: options.characterReferences.length } : null,
       ].filter(Boolean),
+    };
+    pendingSnapshotCaptures.push(pending);
+    const session = createCaptureSession('enqueue', {
+      costText: target.innerText,
+      activation: invocation.activate,
     });
-    notify(`已记录当前配置，等待捕获 ${pendingSnapshotCaptures.length} 项。`, 'success');
     scheduleRefresh();
     updateGenerateClickOverlay();
-    void drainSnapshotCaptures();
+    try {
+      const returned = invocation.originalMethod.apply(invocation.thisArg, invocation.args);
+      const validationPassed = await Promise.race([
+        session.capturePromise,
+        returned && typeof returned.then === 'function'
+          ? Promise.resolve(returned).then(() => false, () => false)
+          : Promise.resolve(false),
+      ]);
+      if (!validationPassed) {
+        discardCaptureSession(session);
+        notify('NovelAI 未通过当前参数校验，本次未加入队列。', 'info');
+      }
+    } catch (error) {
+      discardCaptureSession(session);
+      notify(`NovelAI 参数校验未完成：${error.message || error}`, 'error');
+    } finally {
+      pending.cancelled = true;
+      const pendingIndex = pendingSnapshotCaptures.indexOf(pending);
+      if (pendingIndex >= 0) pendingSnapshotCaptures.splice(pendingIndex, 1);
+      scheduleRefresh();
+      updateGenerateClickOverlay();
+    }
   }
 
   async function captureCurrentBatchPlan() {
@@ -2336,7 +2291,7 @@
     top.className = 'job-top';
     const status = document.createElement('span');
     status.className = 'status';
-    status.textContent = '等待当前生成结束';
+    status.textContent = '等待 NovelAI 校验';
     const time = document.createElement('time');
     time.textContent = new Date(pending.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     top.append(status, time);
@@ -2563,7 +2518,6 @@
     scheduleRefresh();
     if (enabled) {
       kickScheduler();
-      void drainSnapshotCaptures();
     }
   }
 
@@ -2765,7 +2719,6 @@
     scheduleHistorySaveIndicatorUpdate();
     if (settings.queueEnabled) {
       kickScheduler();
-      void drainSnapshotCaptures();
     }
   }
 
@@ -2843,7 +2796,9 @@
         .setting-row small { display: block; margin-top: 2px; color: #979fc9; font-size: 11px; }
         .setting-row input[type="number"], .setting-row select { width: 100%; padding: 6px 7px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 6px; }
         .setting-row input[type="checkbox"] { justify-self: end; width: 19px; height: 19px; accent-color: #1687df; }
-        .settings-actions { display: flex; justify-content: flex-end; gap: 7px; padding-top: 12px; }
+        .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; }
+        .settings-credit { color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
+        .settings-actions { display: flex; justify-content: flex-end; gap: 7px; }
         .generate-hitbox { position: fixed; z-index: 2147482500; display: block; margin: 0; padding: 0; border: 0; border-radius: 3px; color: #fff; background: transparent !important; box-shadow: none; cursor: pointer; font: 700 15px/1 system-ui, sans-serif; }
         .generate-hitbox[data-mode="queue"] { border: 1px solid #65b9ff; background: #1687df !important; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset, 0 5px 16px rgba(0,105,210,.35); }
         .generate-hitbox[data-mode="queue"]:hover { background: #2999ef !important; border-color: #9ad2ff; }
@@ -2914,10 +2869,13 @@
             <label class="setting-row"><span>普通提示停留（秒）<small>点击提示仍可立即关闭，范围 1–30</small></span><input name="toastDurationSeconds" type="number" min="1" max="30" step="1"></label>
             <label class="setting-row"><span>History 保存状态标识<small>缩略图右下角：已保存为绿色，未保存及生成中为红色</small></span><input name="historySaveIndicator" type="checkbox"></label>
           </fieldset>
-          <div class="settings-actions">
-            <button class="settings-reset" type="button">恢复默认</button>
-            <button class="settings-cancel" type="button">取消</button>
-            <button class="primary" type="submit">保存</button>
+          <div class="settings-footer">
+            <small class="settings-credit">by KaerMorh</small>
+            <div class="settings-actions">
+              <button class="settings-reset" type="button">恢复默认</button>
+              <button class="settings-cancel" type="button">取消</button>
+              <button class="primary" type="submit">保存</button>
+            </div>
           </div>
         </form>
       </section>

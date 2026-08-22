@@ -61,16 +61,28 @@ test('captures current React generation parameters without sending in parallel',
   assert.match(source, /root\.stateNode\?\.current === root \? attached : attached\.alternate/);
   assert.match(source, /captureLowLevelGeneration/);
   assert.match(source, /pendingSnapshotCaptures/);
-  assert.match(source, /findGenerationApi\(findGenerateButton\(\), pending\.wantsGrid\)/);
+  assert.match(source, /invocation\.originalMethod\.apply\(invocation\.thisArg, invocation\.args\)/);
+  assert.match(source, /activation: invocation\.activate/);
 });
 
-test('parses multipart request JSON and randomizes every queue attempt seed', () => {
+test('parses multipart request JSON and preserves NovelAI request seeds across retries', () => {
   assert.match(source, /splitMultipartRequestJson/);
   assert.match(source, /multipart-json-ref/);
-  assert.match(source, /withRandomSeed\(prepared\.body\)/);
-  assert.match(source, /crypto\.getRandomValues/);
+  assert.match(source, /fetchWithTimeout\(prepared, execution\)/);
+  assert.doesNotMatch(source, /withRandomSeed/);
+  assert.doesNotMatch(source, /function randomSeed/);
   assert.match(source, /requestHeaders: prepared\.headers/);
   assert.match(source, /headers: job\.requestHeaders \|\| prepared\.headers/);
+});
+
+test('runs NovelAI validation immediately and only queues a produced request', () => {
+  assert.match(source, /session\.type === 'enqueue'/);
+  assert.match(source, /session\.capturePromise/);
+  assert.match(source, /const validationPassed = await Promise\.race/);
+  assert.match(source, /NovelAI 未通过当前参数校验，本次未加入队列/);
+  assert.match(source, /runtime\.activation\(\)/);
+  assert.match(source, /等待 NovelAI 校验/);
+  assert.doesNotMatch(source, /drainSnapshotCaptures/);
 });
 
 test('allows every toast to be dismissed directly', () => {
@@ -128,6 +140,7 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /toggleQueueControl/);
   assert.match(source, /input\[name="queueEnabled"\].*addEventListener\('change'/);
   assert.match(source, /与外部按钮功能相同/);
+  assert.match(source, /<small class="settings-credit">by KaerMorh<\/small>/);
   assert.match(source, /historySaveIndicator: true/);
   assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
 });
@@ -149,7 +162,7 @@ test('freezes the complete request template while changing only the Base Prompt'
   assert.match(source, /v4_prompt\?\.caption/);
   assert.match(source, /parameters\?\.v4_prompt\?\.caption/);
   assert.match(source, /collectBlobRefsFromStoredBody\(batchTemplate \|\| \{}\)/);
-  assert.match(source, /withRandomSeed\(prepared\.body\)/);
+  assert.doesNotMatch(source, /withRandomSeed/);
 });
 
 test('runs batch replacement as a single current item and consumes it only on success', () => {
