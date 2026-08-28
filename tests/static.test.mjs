@@ -3,18 +3,22 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const source = await readFile(new URL('../nai-image-workbench.user.js', import.meta.url), 'utf8');
+const devLoader = await readFile(new URL('../nai-image-workbench.dev.user.js', import.meta.url), 'utf8');
 const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+const versionManifest = JSON.parse(await readFile(new URL('../version.json', import.meta.url), 'utf8'));
 
 test('keeps the public name and release version aligned', () => {
   assert.match(source, /@name\s+NAI Image Workbench/);
   assert.match(source, new RegExp(`@version\\s+${packageJson.version.replaceAll('.', '\\.')}`));
   assert.match(source, new RegExp(`SCRIPT_VERSION = '${packageJson.version.replaceAll('.', '\\.')}'`));
+  assert.equal(versionManifest.version, packageJson.version);
   assert.match(readme, /^# NAI Image Workbench$/m);
 });
 
-test('targets only the NovelAI image page and runs in the main world', () => {
-  assert.match(source, /@match\s+https:\/\/novelai\.net\/image\*/);
+test('loads on NovelAI SPA routes and activates only on the image page', () => {
+  assert.match(source, /@match\s+https:\/\/novelai\.net\/\*/);
+  assert.match(devLoader, /@match\s+https:\/\/novelai\.net\/\*/);
   assert.match(source, /@run-at\s+document-start/);
   assert.match(source, /@sandbox\s+raw/);
   assert.match(source, /@grant\s+none/);
@@ -40,6 +44,19 @@ test('does not load external code or use privileged userscript APIs', () => {
   assert.doesNotMatch(source, /GM_(?:xmlhttpRequest|setValue|getValue|download)/);
 });
 
+test('uses Tampermonkey metadata updates and keeps update controls inside settings', () => {
+  assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/KaerMorh\/nai-image-workbench\/main\/nai-image-workbench\.user\.js/);
+  assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/KaerMorh\/nai-image-workbench\/main\/nai-image-workbench\.user\.js/);
+  assert.match(source, /const UPDATE_MANIFEST_URL = 'https:\/\/raw\.githubusercontent\.com\/KaerMorh\/nai-image-workbench\/main\/version\.json';/);
+  assert.match(source, /const UPDATE_CHECK_INTERVAL_MS = 24 \* 60 \* 60 \* 1_000;/);
+  assert.match(source, /function isVersionNewer\(candidate, current = SCRIPT_VERSION\)/);
+  assert.match(source, /<legend>更新<\/legend>/);
+  assert.match(source, /class="update-check"/);
+  assert.match(source, /class="update-install primary"/);
+  assert.match(source, /void checkForUpdates\(\);/);
+  assert.doesNotMatch(source, /notify\(`发现 v\$\{cachedUpdateInfo\.version\}/);
+});
+
 test('keeps results in NovelAI by resolving the original fetch promise', () => {
   assert.match(source, /deferred\.resolve\(response\)/);
   assert.doesNotMatch(source, /download\s*\(/i);
@@ -56,7 +73,7 @@ test('matches the NovelAI generate button and restores NovelAI disabled state fo
   assert.match(source, /class="generate-hitbox-cost"/);
   assert.match(source, /\.generate-hitbox-cost \{[^}]*color: rgb\(112, 119, 194\);[^}]*background: rgb\(19, 21, 44\);/);
   assert.match(source, /\.generate-hitbox-cost-icon \{[^}]*background: rgb\(112, 119, 194\);/);
-  assert.match(source, /label\.textContent = queueMode \? '加入队列'/);
+  assert.match(source, /label\.textContent = enqueueCaptureInFlight \? '加入中…' : \(queueMode \? '加入队列' : ''\)/);
   assert.match(source, /capturedPrice: extractCapturedPrice\(target\.innerText\)/);
   assert.match(source, /pending\.capturedPrice.*Anlas/);
   assert.match(source, /const domDisabled = button\.disabled/);
@@ -88,6 +105,11 @@ test('captures current React generation parameters without sending in parallel',
   assert.match(source, /source\.includes\('gridXLength'\) && source\.includes\('gridYLength'\)/);
   assert.match(source, /captureLowLevelGeneration/);
   assert.match(source, /pendingSnapshotCaptures/);
+  assert.match(source, /let enqueueCaptureInFlight = false/);
+  assert.match(source, /&& !enqueueCaptureInFlight\s+&& \(Boolean\(cachedBusy\) \|\| activeQueueCount\(\) > 0 \|\| pendingSnapshotCaptures\.length > 0\)/);
+  assert.match(source, /if \(enqueueCaptureInFlight\) \{\s*event\.preventDefault\(\);\s*event\.stopImmediatePropagation\(\);\s*return;\s*\}/);
+  assert.match(source, /enqueueCaptureInFlight = true;\s*updateGenerateClickOverlay\(\)/);
+  assert.match(source, /enqueueCaptureInFlight = false;\s*if \(pending\)/);
   assert.match(source, /activeInvocation\.dispatch\(activeInvocationArgs\)/);
   assert.match(source, /activation: activeInvocation\.activate/);
   assert.match(source, /const fixedSeed = readNativeFixedSeed\(\);\s*const forceNewSeed = fixedSeed === null/);
@@ -114,10 +136,11 @@ test('parses multipart request JSON and preserves NovelAI request seeds across r
 test('waits for generation and rejects a fixed-seed duplicate against only the active predecessor', () => {
   assert.match(source, /session\.type === 'enqueue'/);
   assert.match(source, /while \(cachedBusy\)/);
-  assert.match(source, /let activeInvocation = invocation/);
+  assert.match(source, /let activeInvocation = null/);
+  assert.match(source, /activeInvocation = invocation/);
   assert.match(source, /activation: activeInvocation\.activate/);
   assert.match(source, /comparisonFingerprint: pending\.comparisonFingerprint/);
-  assert.match(source, /validationPassed = await waitForCaptureSession\(session, 1_500\)/);
+  assert.match(source, /validationPassed = await waitForCaptureSession\(session, 15_000\)/);
   assert.match(source, /参数与上一个任务完全相同。你可能需要更改或移除图像种子（Seed）。本次未加入队列/);
   assert.match(source, /const fixedSeed = readNativeFixedSeed\(\)/);
   assert.match(source, /if \(fixedSeed !== null\)/);
@@ -217,8 +240,7 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /settingsHeader\.addEventListener\('pointermove'/);
   assert.match(source, /<legend>队列设置<\/legend>/);
   assert.match(source, /<legend>使用体验<\/legend>/);
-  assert.match(source, /队列禁用/);
-  assert.match(source, /队列启用/);
+  assert.match(source, /queueControl\.textContent = queueControlEnabled \? '禁用' : '启用'/);
   assert.match(source, /toggleQueueControl/);
   assert.match(source, /input\[name="queueEnabled"\].*addEventListener\('change'/);
   assert.match(source, /与外部按钮功能相同/);
@@ -227,6 +249,30 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.match(source, /toastDurationMs: 2_000/);
   assert.match(source, /\.tabs button span \{ margin-left: 9px; \}/);
   assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
+});
+
+test('exports visible Base Prompt and Character textboxes without generation capture', () => {
+  assert.match(source, /class="prompt-export"/);
+  assert.match(source, />导出<\/button>/);
+  assert.match(source, /function readPromptTextboxes\(\)/);
+  assert.match(source, /\.ProseMirror\[contenteditable="true"\]/);
+  assert.match(source, /negative\|undesired/);
+  assert.match(source, /character\|角色\|人物/);
+  assert.match(source, /'Base Prompt:'/);
+  assert.match(source, /`Character\$\{index \+ 1\}:`/);
+  assert.match(source, /navigator\.clipboard\?\.writeText/);
+  assert.match(source, /document\.execCommand\('copy'\)/);
+});
+
+test('watches SPA navigation and gates the workbench to the image route', () => {
+  assert.match(source, /function isImageRoute\(\)/);
+  assert.match(source, /location\.pathname === '\/image'/);
+  assert.match(source, /history\.pushState = function imageWorkbenchPushState/);
+  assert.match(source, /history\.replaceState = function imageWorkbenchReplaceState/);
+  assert.match(source, /window\.addEventListener\('popstate'/);
+  assert.match(source, /nativeSetInterval\(updateRouteState, 1_000\)/);
+  assert.match(source, /if \(!imageRouteActive \|\| !isGenerationUrl\(url\)\)/);
+  assert.match(source, /uiHost\.style\.display = active \? '' : 'none'/);
 });
 
 test('keeps queue status in a permanent strip without crowding the header', () => {

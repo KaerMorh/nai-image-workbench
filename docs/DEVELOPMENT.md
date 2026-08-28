@@ -61,7 +61,7 @@ History 标识读取 NovelAI 自身的下载状态。视觉标识由不接收指
 ## 发布检查
 
 1. 更新用户脚本的 `@version` 和 `SCRIPT_VERSION`。
-2. 同步更新 `package.json` 与 `CHANGELOG.md`。
+2. 同步更新 `package.json`、`version.json` 与 `CHANGELOG.md`。
 3. 运行 `npm test`。
 4. 检查公开文件中是否包含令牌、Cookie、私人 Prompt 或生成结果。
 5. 检查 README 中的安装链接和文档链接。

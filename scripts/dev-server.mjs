@@ -7,6 +7,7 @@ const root = new URL('../', import.meta.url);
 const routes = new Map([
   ['/nai-image-workbench.dev.user.js', new URL('nai-image-workbench.dev.user.js', root)],
   ['/nai-image-workbench.user.js', new URL('nai-image-workbench.user.js', root)],
+  ['/version.json', new URL('version.json', root)],
 ]);
 
 const server = createServer(async (request, response) => {
@@ -22,7 +23,7 @@ const server = createServer(async (request, response) => {
     const source = await readFile(file);
     response.writeHead(200, {
       'Cache-Control': 'no-store, max-age=0',
-      'Content-Type': 'text/javascript; charset=utf-8',
+      'Content-Type': pathname.endsWith('.json') ? 'application/json; charset=utf-8' : 'text/javascript; charset=utf-8',
     });
     response.end(source);
   } catch (error) {

@@ -4,7 +4,7 @@
 // @version      1.0.1
 // @description  Loads NAI Image Workbench directly from the local workspace for development.
 // @author       Local
-// @match        https://novelai.net/image*
+// @match        https://novelai.net/*
 // @run-at       document-start
 // @sandbox      raw
 // @noframes

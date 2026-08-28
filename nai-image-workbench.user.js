@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.6
+// @version      0.6.7
 // @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
-// @match        https://novelai.net/image*
+// @match        https://novelai.net/*
+// @updateURL    https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js
+// @downloadURL  https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js
 // @run-at       document-start
 // @sandbox      raw
 // @noframes
@@ -17,7 +19,11 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.6';
+  const SCRIPT_VERSION = '0.6.7';
+  const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
+  const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
+  const UPDATE_META_KEY = 'update-check';
+  const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
   const DB_NAME = 'nai-image-workbench';
   const DB_VERSION = 1;
   const JOB_STORE = 'jobs';
@@ -50,6 +56,9 @@
   let dbPromise;
   let uiHost;
   let shadow;
+  let imageRouteActive = false;
+  let initialized = false;
+  let initializationPromise = null;
   let schedulerRunning = false;
   let refreshTimer = null;
   let kickTimer = null;
@@ -64,11 +73,13 @@
   let cachedJobs = [];
   let cachedState = defaultState();
   let cachedBusy = null;
+  let cachedUpdateInfo = null;
   let idleJotaiBooleanAtoms = [];
   let snapshotProbeChain = Promise.resolve();
   let pendingDirectComparisonCapture = null;
   let activeDirectComparisonFingerprintPromise = null;
   let replayingDirectGenerateClick = false;
+  let enqueueCaptureInFlight = false;
   let captureSequence = 0;
   const captureSessions = [];
   const pendingSnapshotCaptures = [];
@@ -167,6 +178,99 @@
       toastPosition,
       historySaveIndicator: Boolean(value.historySaveIndicator),
     };
+  }
+
+  function parseSemanticVersion(value) {
+    const match = String(value || '').trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+    return match ? match.slice(1).map(Number) : null;
+  }
+
+  function isVersionNewer(candidate, current = SCRIPT_VERSION) {
+    const candidateParts = parseSemanticVersion(candidate);
+    const currentParts = parseSemanticVersion(current);
+    if (!candidateParts || !currentParts) return false;
+    for (let index = 0; index < candidateParts.length; index += 1) {
+      if (candidateParts[index] > currentParts[index]) return true;
+      if (candidateParts[index] < currentParts[index]) return false;
+    }
+    return false;
+  }
+
+  function updateInstallUrl(version) {
+    return `${UPDATE_INSTALL_URL}?v=${encodeURIComponent(version)}`;
+  }
+
+  function formatUpdateCheckTime(timestamp) {
+    const date = new Date(Number(timestamp));
+    return Number.isFinite(date.getTime())
+      ? date.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', month: 'numeric', day: 'numeric' })
+      : '';
+  }
+
+  function renderUpdateUi() {
+    if (!shadow) return;
+    const current = shadow.querySelector('.update-current');
+    const status = shadow.querySelector('.update-status');
+    const check = shadow.querySelector('.update-check');
+    const install = shadow.querySelector('.update-install');
+    if (!current || !status || !check || !install) return;
+    current.textContent = `当前版本 v${SCRIPT_VERSION}`;
+    check.disabled = cachedUpdateInfo?.status === 'checking';
+    install.hidden = true;
+    if (cachedUpdateInfo?.status === 'checking') {
+      status.textContent = '正在检查更新…';
+      return;
+    }
+    if (cachedUpdateInfo?.status === 'available') {
+      status.textContent = `发现 v${cachedUpdateInfo.version}，安装将由 Tampermonkey 确认。`;
+      install.textContent = `安装 v${cachedUpdateInfo.version}`;
+      install.hidden = false;
+      return;
+    }
+    if (cachedUpdateInfo?.status === 'current') {
+      const checkedAt = formatUpdateCheckTime(cachedUpdateInfo.checkedAt);
+      status.textContent = checkedAt ? `已是最新版本 · ${checkedAt} 检查` : '已是最新版本。';
+      return;
+    }
+    if (cachedUpdateInfo?.status === 'error') {
+      status.textContent = '暂时无法检查更新，请稍后重试。';
+      return;
+    }
+    status.textContent = '打开设置时会自动检查，每 24 小时最多一次。';
+  }
+
+  async function checkForUpdates({ force = false } = {}) {
+    const previous = cachedUpdateInfo || await getMeta(UPDATE_META_KEY);
+    if (!force && previous?.status && previous?.checkedAt && now() - Number(previous.checkedAt) < UPDATE_CHECK_INTERVAL_MS) {
+      cachedUpdateInfo = previous;
+      renderUpdateUi();
+      return cachedUpdateInfo;
+    }
+    cachedUpdateInfo = { status: 'checking' };
+    renderUpdateUi();
+    try {
+      const response = await nativeFetch(`${UPDATE_MANIFEST_URL}?check=${now()}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`更新信息请求失败：${response.status}`);
+      const manifest = await response.json();
+      const version = String(manifest?.version || '').trim();
+      if (!parseSemanticVersion(version)) throw new Error('更新信息中的版本号无效。');
+      cachedUpdateInfo = {
+        status: isVersionNewer(version) ? 'available' : 'current',
+        version,
+        checkedAt: now(),
+      };
+      await setMeta(UPDATE_META_KEY, cachedUpdateInfo, { broadcast: false });
+    } catch (error) {
+      console.warn('[NAI Image Workbench] Update check failed:', error);
+      cachedUpdateInfo = { status: 'error' };
+    }
+    renderUpdateUi();
+    return cachedUpdateInfo;
+  }
+
+  function installAvailableUpdate() {
+    if (cachedUpdateInfo?.status !== 'available' || !parseSemanticVersion(cachedUpdateInfo.version)) return;
+    window.open(updateInstallUrl(cachedUpdateInfo.version), '_blank', 'noopener,noreferrer');
   }
 
   function sleep(ms) {
@@ -320,6 +424,89 @@
       return rect.width > 0 && rect.height > 0;
     });
     return String(editors[0]?.innerText || editors[0]?.textContent || '').trim();
+  }
+
+  function isVisiblePromptEditor(editor) {
+    if (!(editor instanceof HTMLElement)) return false;
+    const rect = editor.getBoundingClientRect();
+    const style = getComputedStyle(editor);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
+  function promptEditorText(editor) {
+    return String(editor?.innerText || editor?.textContent || '').trim();
+  }
+
+  function promptEditorContext(editor) {
+    const labels = [];
+    let node = editor?.parentElement;
+    for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
+      const editableCount = node.querySelectorAll('.ProseMirror[contenteditable="true"]').length;
+      if (editableCount > 1) break;
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll('.ProseMirror, [contenteditable="true"], textarea, input').forEach((field) => field.remove());
+      const label = normalizeWhitespace(clone.textContent);
+      if (label && !labels.includes(label)) labels.push(label);
+    }
+    return labels.join(' ');
+  }
+
+  function readPromptTextboxes() {
+    const editors = Array.from(document.querySelectorAll('.ProseMirror[contenteditable="true"]'))
+      .filter(isVisiblePromptEditor);
+    const baseEditor = editors[0] || null;
+    const characterPrompts = [];
+    for (const editor of editors.slice(1)) {
+      const value = promptEditorText(editor);
+      if (!value) continue;
+      const context = promptEditorContext(editor);
+      if (/(?:negative|undesired|uc\b|负面|不希望|排除)/i.test(context)) continue;
+      if (/(?:character|角色|人物)/i.test(context)) characterPrompts.push(value);
+    }
+    return {
+      basePrompt: promptEditorText(baseEditor),
+      characterPrompts,
+    };
+  }
+
+  function formatPromptExport(basePrompt, characterPrompts) {
+    const lines = ['```', 'Base Prompt:', basePrompt, '---'];
+    characterPrompts.forEach((prompt, index) => {
+      lines.push(`Character${index + 1}:`, prompt, '---');
+    });
+    lines.push('```');
+    return lines.join('\n');
+  }
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch {
+        // Fall back to the legacy copy command when browser clipboard permission is unavailable.
+      }
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.append(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('浏览器拒绝了剪贴板写入。');
+  }
+
+  async function exportPromptTextboxes() {
+    const { basePrompt, characterPrompts } = readPromptTextboxes();
+    if (!basePrompt) {
+      notify('没有找到可导出的 Base Prompt 文本。', 'error');
+      return;
+    }
+    await copyTextToClipboard(formatPromptExport(basePrompt, characterPrompts));
+    notify(`Prompt 已复制${characterPrompts.length ? `，包含 ${characterPrompts.length} 个 Character` : ''}。`, 'success');
   }
 
   function normalizeWhitespace(value) {
@@ -2016,6 +2203,7 @@
   }
 
   async function advanceBatchController() {
+    if (!imageRouteActive) return;
     if (batchControllerRunning) return;
     batchControllerRunning = true;
     try {
@@ -2094,6 +2282,7 @@
   }
 
   function scheduleBatchController() {
+    if (!imageRouteActive) return;
     if (batchControllerTimer) nativeClearTimeout(batchControllerTimer);
     batchControllerTimer = nativeSetTimeout(() => {
       batchControllerTimer = null;
@@ -2102,6 +2291,7 @@
   }
 
   async function runScheduler() {
+    if (!imageRouteActive) return;
     if (schedulerRunning) return;
     schedulerRunning = true;
     try {
@@ -2157,6 +2347,7 @@
   }
 
   function kickScheduler() {
+    if (!imageRouteActive) return;
     if (kickTimer) nativeClearTimeout(kickTimer);
     kickTimer = nativeSetTimeout(() => {
       kickTimer = null;
@@ -2166,7 +2357,7 @@
 
   window.fetch = async function queuedFetch(input, init) {
     const url = input instanceof Request ? input.url : input;
-    if (!isGenerationUrl(url)) return nativeFetch(input, init);
+    if (!imageRouteActive || !isGenerationUrl(url)) return nativeFetch(input, init);
 
     const captureSession = consumeCaptureSession();
     if (captureSession) return handleCapturedGenerationFetch(input, init, captureSession);
@@ -2238,10 +2429,16 @@
 
   function shouldCaptureGenerateClick() {
     return cachedState.settings.queueEnabled && !cachedState.paused
+      && !enqueueCaptureInFlight
       && (Boolean(cachedBusy) || activeQueueCount() > 0 || pendingSnapshotCaptures.length > 0);
   }
 
   function updateGenerateClickOverlay() {
+    if (!imageRouteActive) {
+      const inactiveOverlay = shadow?.querySelector('.generate-hitbox');
+      if (inactiveOverlay) inactiveOverlay.hidden = true;
+      return;
+    }
     if (!shadow) return;
     const overlay = shadow.querySelector('.generate-hitbox');
     const button = findGenerateButton();
@@ -2263,13 +2460,14 @@
     overlay.style.width = `${rect.width}px`;
     overlay.style.height = `${rect.height}px`;
     overlay.dataset.paused = cachedState.paused ? 'true' : 'false';
-    const queueMode = shouldCaptureGenerateClick();
+    const queueMode = shouldCaptureGenerateClick() || enqueueCaptureInFlight;
     overlay.dataset.mode = queueMode ? 'queue' : 'blocked';
+    overlay.dataset.capturing = enqueueCaptureInFlight ? 'true' : 'false';
     const label = overlay.querySelector('.generate-hitbox-label');
     const cost = overlay.querySelector('.generate-hitbox-cost');
     const costValue = overlay.querySelector('.generate-hitbox-cost-value');
     const costIcon = overlay.querySelector('.generate-hitbox-cost-icon');
-    label.textContent = queueMode ? '加入队列' : '';
+    label.textContent = enqueueCaptureInFlight ? '加入中…' : (queueMode ? '加入队列' : '');
     const capturedPrice = extractCapturedPrice(button.innerText);
     cost.hidden = !queueMode || capturedPrice === null;
     if (capturedPrice !== null) costValue.textContent = String(capturedPrice);
@@ -2287,7 +2485,9 @@
       : `把当前 NovelAI 配置加入队列，消耗 ${capturedPrice} Anlas`);
     overlay.title = cachedState.paused
       ? '队列已暂停；当前生成结束前不能直接生成'
-      : '点击会把当前配置加入 NAI Image Workbench 队列';
+      : enqueueCaptureInFlight
+        ? '正在读取当前配置，请稍等'
+        : '点击会把当前配置加入 NAI Image Workbench 队列';
   }
 
   async function waitForCaptureSession(session, timeoutMs = 15_000) {
@@ -2311,76 +2511,85 @@
       }
       return;
     }
+    if (enqueueCaptureInFlight) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if (!shouldCaptureGenerateClick()) return;
 
     event.preventDefault();
     event.stopImmediatePropagation();
-    const busyRelease = temporarilyReleaseNovelAIBusy(target);
-    if (!busyRelease) {
-      notify('无法唯一定位 NovelAI 的生成锁，队列已暂停。', 'error');
-      void saveState({ paused: true }).then(scheduleRefresh);
-      return;
-    }
-    const preparedCallback = prepareCurrentGenerationCallback(target, busyRelease);
-    if (!preparedCallback) {
-      notify('无法调用 NovelAI 当前生成回调，队列已暂停。', 'error');
-      void saveState({ paused: true }).then(scheduleRefresh);
-      return;
-    }
-    const fixedSeed = readNativeFixedSeed();
-    const forceNewSeed = fixedSeed === null;
-    const invocation = await (snapshotProbeChain = snapshotProbeChain
-      .catch(() => undefined)
-      .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed, bridgeResult: true })));
-    if (!invocation) {
-      notify('无法完整读取当前配置，队列已暂停。', 'error');
-      void saveState({ paused: true }).then(scheduleRefresh);
-      return;
-    }
-    const options = invocation.args[0] || {};
-    const invocationArgs = [...invocation.args];
-    if (forceNewSeed) {
-      const invocationOptions = invocationArgs[0] || {};
-      invocationArgs[0] = {
-        ...invocationOptions,
-        params: { ...(invocationOptions.params || {}), seed: createUnfixedImageSeed() },
-      };
-    }
-    const comparisonFingerprint = await officialGenerationFingerprint(invocationArgs);
-    if (fixedSeed !== null) {
-      const predecessorFingerprint = await immediateDuplicateBaselineFingerprint();
-      if (predecessorFingerprint && predecessorFingerprint === comparisonFingerprint) {
-        invocation.cancel();
-        notify(DUPLICATE_ENQUEUE_MESSAGE, 'info');
+    enqueueCaptureInFlight = true;
+    updateGenerateClickOverlay();
+    let pending = null;
+    let session = null;
+    let invocation = null;
+    let activeInvocation = null;
+    try {
+      const busyRelease = temporarilyReleaseNovelAIBusy(target);
+      if (!busyRelease) {
+        notify('无法唯一定位 NovelAI 的生成锁，队列已暂停。', 'error');
+        void saveState({ paused: true }).then(scheduleRefresh);
         return;
       }
-    }
-    const pending = {
-      id: crypto.randomUUID(),
-      createdAt: now(),
-      invocation,
-      busyAccess: busyRelease,
-      costText: target.innerText,
-      capturedPrice: extractCapturedPrice(target.innerText),
-      wantsGrid: preparedCallback.wantsGrid,
-      promptPreview: truncate(options.prompt || '(正在读取 Prompt)', 80),
-      model: String(options.model || '未知模型'),
-      width: Number(options.params?.width) || null,
-      height: Number(options.params?.height) || null,
-      imageCount: Number(options.params?.n_samples) || 1,
-      imageFlags: [
-        options.initImage ? { label: 'I2I', count: 1 } : null,
-        options.referenceImages?.length ? { label: 'Vibe/参考', count: options.referenceImages.length } : null,
-        options.characterReferences?.length ? { label: '角色参考', count: options.characterReferences.length } : null,
-      ].filter(Boolean),
-      comparisonFingerprint,
-    };
-    pendingSnapshotCaptures.push(pending);
-    let session = null;
-    let activeInvocation = invocation;
-    scheduleRefresh();
-    updateGenerateClickOverlay();
-    try {
+      const preparedCallback = prepareCurrentGenerationCallback(target, busyRelease);
+      if (!preparedCallback) {
+        notify('无法调用 NovelAI 当前生成回调，队列已暂停。', 'error');
+        void saveState({ paused: true }).then(scheduleRefresh);
+        return;
+      }
+      const fixedSeed = readNativeFixedSeed();
+      const forceNewSeed = fixedSeed === null;
+      invocation = await (snapshotProbeChain = snapshotProbeChain
+        .catch(() => undefined)
+        .then(() => captureGenerationInvocation(preparedCallback, busyRelease, { force: forceNewSeed, bridgeResult: true })));
+      if (!invocation) {
+        notify('无法完整读取当前配置，队列已暂停。', 'error');
+        void saveState({ paused: true }).then(scheduleRefresh);
+        return;
+      }
+      activeInvocation = invocation;
+      const options = invocation.args[0] || {};
+      const invocationArgs = [...invocation.args];
+      if (forceNewSeed) {
+        const invocationOptions = invocationArgs[0] || {};
+        invocationArgs[0] = {
+          ...invocationOptions,
+          params: { ...(invocationOptions.params || {}), seed: createUnfixedImageSeed() },
+        };
+      }
+      const comparisonFingerprint = await officialGenerationFingerprint(invocationArgs);
+      if (fixedSeed !== null) {
+        const predecessorFingerprint = await immediateDuplicateBaselineFingerprint();
+        if (predecessorFingerprint && predecessorFingerprint === comparisonFingerprint) {
+          notify(DUPLICATE_ENQUEUE_MESSAGE, 'info');
+          return;
+        }
+      }
+      pending = {
+        id: crypto.randomUUID(),
+        createdAt: now(),
+        invocation,
+        busyAccess: busyRelease,
+        costText: target.innerText,
+        capturedPrice: extractCapturedPrice(target.innerText),
+        wantsGrid: preparedCallback.wantsGrid,
+        promptPreview: truncate(options.prompt || '(正在读取 Prompt)', 80),
+        model: String(options.model || '未知模型'),
+        width: Number(options.params?.width) || null,
+        height: Number(options.params?.height) || null,
+        imageCount: Number(options.params?.n_samples) || 1,
+        imageFlags: [
+          options.initImage ? { label: 'I2I', count: 1 } : null,
+          options.referenceImages?.length ? { label: 'Vibe/参考', count: options.referenceImages.length } : null,
+          options.characterReferences?.length ? { label: '角色参考', count: options.characterReferences.length } : null,
+        ].filter(Boolean),
+        comparisonFingerprint,
+      };
+      pendingSnapshotCaptures.push(pending);
+      scheduleRefresh();
+      updateGenerateClickOverlay();
       while (cachedBusy) {
         if (pending.cancelled) return;
         await sleep(100);
@@ -2425,7 +2634,7 @@
           : refreshInvocationRuntimeCallbacks(invocationArgs, activeInvocation.args);
         returned = activeInvocation.dispatch(activeInvocationArgs);
         if (returned && typeof returned.catch === 'function') returned.catch(() => undefined);
-        validationPassed = await waitForCaptureSession(session, 1_500);
+        validationPassed = await waitForCaptureSession(session, 15_000);
       } finally {
         if (wasNovelAIBusy && cachedBusy && !activeBusyRelease.store.get(activeBusyRelease.atom)) {
           activeBusyRelease.store.set(activeBusyRelease.atom, true);
@@ -2447,11 +2656,14 @@
       if (session) discardCaptureSession(session);
       notify(`NovelAI 参数校验未完成：${error.message || error}`, 'error');
     } finally {
-      invocation.cancel();
-      if (activeInvocation !== invocation) activeInvocation.cancel();
-      pending.cancelled = true;
-      const pendingIndex = pendingSnapshotCaptures.indexOf(pending);
-      if (pendingIndex >= 0) pendingSnapshotCaptures.splice(pendingIndex, 1);
+      if (invocation) invocation.cancel();
+      if (activeInvocation && activeInvocation !== invocation) activeInvocation.cancel();
+      if (pending) pending.cancelled = true;
+      enqueueCaptureInFlight = false;
+      if (pending) {
+        const pendingIndex = pendingSnapshotCaptures.indexOf(pending);
+        if (pendingIndex >= 0) pendingSnapshotCaptures.splice(pendingIndex, 1);
+      }
       scheduleRefresh();
       updateGenerateClickOverlay();
     }
@@ -3130,6 +3342,8 @@
     fillSettingsForm();
     const dialog = shadow.querySelector('.settings-dialog');
     dialog.hidden = false;
+    renderUpdateUi();
+    void checkForUpdates();
     if (cachedState.settingsPosition?.left && cachedState.settingsPosition?.top) {
       dialog.style.left = cachedState.settingsPosition.left;
       dialog.style.top = cachedState.settingsPosition.top;
@@ -3270,6 +3484,11 @@
         .setting-row small { display: block; margin-top: 2px; color: #979fc9; font-size: 11px; }
         .setting-row input[type="number"], .setting-row select { width: 100%; padding: 6px 7px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 6px; }
         .setting-row input[type="checkbox"] { justify-self: end; width: 19px; height: 19px; accent-color: #1687df; }
+        .update-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 8px 0; }
+        .update-current { display: block; color: #dce0ff; font-size: 12px; }
+        .update-status { display: block; margin-top: 2px; color: #979fc9; font-size: 11px; overflow-wrap: anywhere; }
+        .update-actions { display: flex; justify-content: flex-end; padding: 0 0 8px; }
+        .update-install[hidden] { display: none; }
         .settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; }
         .settings-credit { margin-left: 10px; color: #858db8; font-size: 10px; letter-spacing: .02em; white-space: nowrap; }
         .settings-actions { display: flex; justify-content: flex-end; gap: 7px; }
@@ -3287,7 +3506,8 @@
       <section class="panel" aria-label="NAI Image Workbench 队列">
         <header class="header">
           <div class="title">NAI Image Workbench</div>
-          <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">队列禁用</button>
+          <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">禁用</button>
+          <button class="prompt-export" type="button" title="复制当前 Base Prompt 和 Character Prompt">导出</button>
           <button class="settings" type="button">设置</button>
           <button class="collapse" type="button" title="展开面板" aria-label="展开面板">+</button>
         </header>
@@ -3336,7 +3556,7 @@
         <form class="settings-form">
           <fieldset class="setting-group">
             <legend>队列设置</legend>
-            <label class="setting-row" title="与面板顶部的“队列启用 / 队列禁用”按钮功能相同；修改后立即生效"><span>启用等待队列<small>与外部按钮功能相同；关闭后不接管 Generate，也不派发后续任务</small></span><input name="queueEnabled" type="checkbox"></label>
+            <label class="setting-row" title="与面板顶部的“启用 / 禁用”按钮功能相同；修改后立即生效"><span>启用等待队列<small>与外部按钮功能相同；关闭后不接管 Generate，也不派发后续任务</small></span><input name="queueEnabled" type="checkbox"></label>
             <label class="setting-row"><span>自动重试次数<small>只用于 429 与连接失败，范围 0–3</small></span><input name="maxRetries" type="number" min="0" max="3" step="1"></label>
             <label class="setting-row"><span>任务间隔（秒）<small>前一任务完成后再等待，范围 0.5–10</small></span><input name="interJobDelaySeconds" type="number" min="0.5" max="10" step="0.5"></label>
             <label class="setting-row"><span>已结束记录上限<small>超出后自动删除最旧记录，范围 10–100</small></span><input name="maxFinished" type="number" min="10" max="100" step="1"></label>
@@ -3346,6 +3566,11 @@
             <label class="setting-row"><span>提示位置<small>可放在右上角、右下角，或完全关闭</small></span><select name="toastPosition"><option value="top-right">右上角</option><option value="bottom-right">右下角</option><option value="off">关闭</option></select></label>
             <label class="setting-row"><span>普通提示停留（秒）<small>点击提示仍可立即关闭，范围 1–30</small></span><input name="toastDurationSeconds" type="number" min="1" max="30" step="1"></label>
             <label class="setting-row"><span>History 保存状态标识<small>缩略图右下角：已保存为绿色，未保存及生成中为红色</small></span><input name="historySaveIndicator" type="checkbox"></label>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>更新</legend>
+            <div class="update-row"><span><strong class="update-current">当前版本</strong><small class="update-status">打开设置时会自动检查，每 24 小时最多一次。</small></span><button class="update-check" type="button">检查更新</button></div>
+            <div class="update-actions"><button class="update-install primary" type="button" hidden></button></div>
           </fieldset>
           <div class="settings-footer">
             <small class="settings-credit">by KaerMorh</small>
@@ -3363,10 +3588,17 @@
     document.documentElement.append(uiHost);
 
     shadow.querySelector('.queue-toggle').addEventListener('click', () => void toggleQueueControl());
+    shadow.querySelector('.prompt-export').addEventListener('click', () => {
+      void exportPromptTextboxes().catch((error) => {
+        notify(`导出失败：${error.message || error}`, 'error');
+      });
+    });
     shadow.querySelector('.settings').addEventListener('click', openSettings);
     shadow.querySelector('.settings-close').addEventListener('click', closeSettings);
     shadow.querySelector('.settings-cancel').addEventListener('click', closeSettings);
     shadow.querySelector('.settings-reset').addEventListener('click', () => fillSettingsForm(defaultState().settings, true));
+    shadow.querySelector('.update-check').addEventListener('click', () => void checkForUpdates({ force: true }));
+    shadow.querySelector('.update-install').addEventListener('click', installAvailableUpdate);
     shadow.querySelector('input[name="queueEnabled"]').addEventListener('change', (event) => {
       const enabled = event.currentTarget.checked;
       void setQueueControlEnabled(enabled);
@@ -3618,7 +3850,7 @@
     }
     const queueControlEnabled = isQueueControlEnabled(cachedState);
     const queueControl = shadow.querySelector('.queue-toggle');
-    queueControl.textContent = queueControlEnabled ? '队列禁用' : '队列启用';
+    queueControl.textContent = queueControlEnabled ? '禁用' : '启用';
     queueControl.classList.toggle('primary', !queueControlEnabled);
     queueControl.title = queueControlEnabled
       ? '点击禁用等待队列；与设置中的“启用等待队列”是同一个开关'
@@ -3678,6 +3910,61 @@
       refreshTimer = null;
       void refreshUi();
     }, 40);
+  }
+
+  function isImageRoute() {
+    return location.hostname === 'novelai.net'
+      && (location.pathname === '/image' || location.pathname.startsWith('/image/'));
+  }
+
+  function updateRouteState() {
+    const active = isImageRoute();
+    imageRouteActive = active;
+    if (uiHost) uiHost.style.display = active ? '' : 'none';
+    if (!active) {
+      updateGenerateClickOverlay();
+      return;
+    }
+    if (!initialized && !initializationPromise) {
+      initializationPromise = initialize()
+        .then(() => {
+          initialized = true;
+        })
+        .catch((error) => {
+          console.error('[NAI Image Workbench] Initialization failed:', error);
+        })
+        .finally(() => {
+          initializationPromise = null;
+        });
+      return;
+    }
+    if (initialized) {
+      scheduleRefresh();
+      kickScheduler();
+      scheduleBatchController();
+    }
+  }
+
+  function scheduleRouteStateUpdate() {
+    nativeSetTimeout(updateRouteState, 0);
+  }
+
+  function installRouteWatcher() {
+    const nativePushState = history.pushState.bind(history);
+    const nativeReplaceState = history.replaceState.bind(history);
+    history.pushState = function imageWorkbenchPushState(...args) {
+      const result = nativePushState(...args);
+      scheduleRouteStateUpdate();
+      return result;
+    };
+    history.replaceState = function imageWorkbenchReplaceState(...args) {
+      const result = nativeReplaceState(...args);
+      scheduleRouteStateUpdate();
+      return result;
+    };
+    window.addEventListener('popstate', scheduleRouteStateUpdate, { passive: true });
+    window.addEventListener('hashchange', scheduleRouteStateUpdate, { passive: true });
+    nativeSetInterval(updateRouteState, 1_000);
   }
 
   async function initialize() {
@@ -3750,9 +4037,10 @@
     scheduleBatchController();
   }
 
-  const start = () => void initialize().catch((error) => {
-    console.error('[NAI Image Workbench] Initialization failed:', error);
-  });
+  const start = () => {
+    installRouteWatcher();
+    updateRouteState();
+  };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();
 })();
