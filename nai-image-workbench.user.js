@@ -477,18 +477,17 @@
     });
   }
 
-  function unescapePromptLine(line) {
-    if (!line.startsWith('\\')) return line;
-    const unescaped = line.slice(1);
-    return unescaped.startsWith('\\') || NAI5_PROMPT_MARKERS.has(unescaped) ? unescaped : line;
-  }
-
   function trimPromptLines(lines) {
     let start = 0;
     let end = lines.length;
     while (start < end && lines[start].trim() === '') start += 1;
     while (end > start && lines[end - 1].trim() === '') end -= 1;
-    return lines.slice(start, end).map(unescapePromptLine).join('\n');
+    return lines.slice(start, end).join('\n');
+  }
+
+  function assertNoReservedPromptMarkers(value, label) {
+    const marker = Array.from(NAI5_PROMPT_MARKERS).find((candidate) => String(value ?? '').includes(candidate));
+    if (marker) throw new Error(`${label} 不能包含保留标记 ${marker}。`);
   }
 
   function parseNai5PromptText(source) {
@@ -516,6 +515,7 @@
     expect('[NAI5_PROMPT_V1]', '首个非空行必须是 [NAI5_PROMPT_V1]。');
     expect('[MAIN]', '[NAI5_PROMPT_V1] 后必须是 [MAIN]。');
     const main = readUntil(new Set(['[CHARACTER]', '[END]']), '[MAIN]');
+    assertNoReservedPromptMarkers(main, 'Base Prompt');
     const characters = [];
 
     while (lines[index] === '[CHARACTER]') {
@@ -548,6 +548,7 @@
       expect('[PROMPT]', `Character ${characterNumber} 的位置后必须是 [PROMPT]，且只能有一个坐标。`);
       const prompt = readUntil(new Set(['[CHARACTER]', '[END]']), `Character ${characterNumber} 的 [PROMPT]`);
       if (!prompt.trim()) throw promptFormatError(`Character ${characterNumber} 缺少正面提示词。`, index + 1);
+      assertNoReservedPromptMarkers(prompt, `Character ${characterNumber} 的 Prompt`);
       characters.push({ position: { x, y }, prompt });
     }
 
@@ -558,10 +559,8 @@
     return { main, characters };
   }
 
-  function escapePromptText(value) {
-    return String(value ?? '').replace(/\r\n?/g, '\n').split('\n').map((line) => (
-      line.startsWith('\\') || NAI5_PROMPT_MARKERS.has(line) ? `\\${line}` : line
-    )).join('\n');
+  function formatPromptBody(value) {
+    return String(value ?? '').replace(/\r\n?/g, '\n');
   }
 
   function formatCoordinate(value) {
@@ -575,16 +574,18 @@
     if (characters.length > MAX_NAI5_PROMPT_CHARACTERS) {
       throw new Error(`Character 不能超过 ${MAX_NAI5_PROMPT_CHARACTERS} 个。`);
     }
-    const lines = ['[NAI5_PROMPT_V1]', '', '[MAIN]', escapePromptText(basePrompt)];
+    assertNoReservedPromptMarkers(basePrompt, 'Base Prompt');
+    const lines = ['[NAI5_PROMPT_V1]', '', '[MAIN]', formatPromptBody(basePrompt)];
     for (const character of characters) {
       if (!String(character?.prompt ?? '').trim()) throw new Error('Character 缺少正面提示词。');
+      assertNoReservedPromptMarkers(character.prompt, 'Character Prompt');
       lines.push(
         '',
         '[CHARACTER]',
         '[POSITION]',
         `${formatCoordinate(character?.position?.x)}, ${formatCoordinate(character?.position?.y)}`,
         '[PROMPT]',
-        escapePromptText(character.prompt),
+        formatPromptBody(character.prompt),
       );
     }
     lines.push('', '[END]');
@@ -3703,22 +3704,58 @@
 
   function promptFormatRequirementsText() {
     return [
+      '请将内容整理为 NAI5_PROMPT_V1 格式。',
+      '',
+      '输出要求：',
+      '',
+      '1. 只输出一个 Markdown text 代码块，代码块外不要添加解释、标题或备注。',
+      '2. 只记录正面提示词，不要输出 Undesired Content、负面提示词、模型参数或生成说明。',
+      '3. 不要翻译、改写、纠错、合并或重新排序提示词。',
+      '4. Base Prompt 写在 [MAIN] 后面。',
+      '5. 每个 Character 使用一个独立的 [CHARACTER] 区块，顺序与原内容一致。',
+      `6. Character 数量最多为 ${MAX_NAI5_PROMPT_CHARACTERS} 个。`,
+      '7. 每个 Character 必须包含一个 [POSITION] 和一个 [PROMPT]。',
+      '8. [POSITION] 的下一行只能填写 x, y：x 和 y 的范围都是 0 至 1，最多保留三位小数，每个 Character 只能有一个位置。',
+      '9. [PROMPT] 的下一行开始填写该 Character 的正面提示词。',
+      '10. 所有格式标记必须单独占一行，标记后面不能附带正文。',
+      '11. [END] 必须是最后一个格式标记。',
+      '12. Prompt 正文中不得使用以下保留标记：[NAI5_PROMPT_V1]、[MAIN]、[CHARACTER]、[POSITION]、[PROMPT]、[END]。',
+      '13. 不要输出 &#x20;、&nbsp; 等 HTML 实体。',
+      '14. 不要在格式标记中添加反斜杠或 Markdown 转义。',
+      '',
+      '有 Character 时使用以下结构：',
+      '',
+      '```text',
       '[NAI5_PROMPT_V1]',
       '',
       '[MAIN]',
-      '主正面提示词',
+      'Base Prompt 正面提示词',
       '',
       '[CHARACTER]',
       '[POSITION]',
-      '0.5, 0.5',
+      '0.500, 0.500',
       '[PROMPT]',
-      'Character 正面提示词',
+      '第一个 Character 的正面提示词',
+      '',
+      '[CHARACTER]',
+      '[POSITION]',
+      '0.250, 0.750',
+      '[PROMPT]',
+      '第二个 Character 的正面提示词',
       '',
       '[END]',
+      '```',
       '',
-      '请以 Markdown 形式输出，并使用 text 代码块包裹完整内容。',
-      `规则：0–${MAX_NAI5_PROMPT_CHARACTERS} 个 Character；每个 Character 恰好一个 x, y 坐标，x/y 范围均为 0–1，最多三位小数；只导入正面提示词。`,
-      '提示词中的保留标记独占一行时，在行首添加反斜杠；原本以反斜杠开头的行也再添加一个反斜杠。',
+      '没有 Character 时使用：',
+      '',
+      '```text',
+      '[NAI5_PROMPT_V1]',
+      '',
+      '[MAIN]',
+      'Base Prompt 正面提示词',
+      '',
+      '[END]',
+      '```',
     ].join('\n');
   }
 

@@ -279,7 +279,8 @@ test('imports and exports the versioned NAI5 positive-prompt format', () => {
   assert.match(source, /class="prompt-import-undo"/);
   assert.match(source, /class="prompt-export-current"/);
   assert.match(source, /class="prompt-copy-requirements"/);
-  assert.match(source, /请以 Markdown 形式输出，并使用 text 代码块包裹完整内容。/);
+  assert.match(source, /只输出一个 Markdown text 代码块/);
+  assert.match(source, /不要在格式标记中添加反斜杠或 Markdown 转义/);
   assert.match(source, /addEventListener\('dblclick'/);
   assert.match(source, /navigator\.clipboard\?\.writeText/);
   assert.match(source, /document\.execCommand\('copy'\)/);
@@ -289,24 +290,24 @@ test('imports and exports the versioned NAI5 positive-prompt format', () => {
   assert.doesNotMatch(promptCapture, /\.dispatch\(|\.activate\(|originalMethod/);
 });
 
-test('round-trips multiline prompts, reserved markers, backslashes, and positions', () => {
+test('round-trips multiline prompts, ordinary backslashes, and positions', () => {
   const { parseNai5PromptText, formatNai5PromptText } = loadPromptFormatFunctions();
   const expected = {
-    main: 'scene line\n[CHARACTER]\n\\literal',
+    main: 'scene line\n\\literal',
     characters: [
-      { prompt: 'girl-A\n[PROMPT]', position: { x: 0.506, y: 0.102 } },
+      { prompt: 'girl-A\nsecond line', position: { x: 0.506, y: 0.102 } },
       { prompt: 'girl-B', position: { x: 1, y: 0 } },
     ],
   };
   const exported = formatNai5PromptText(expected.main, expected.characters);
   assert.match(exported, /^\[NAI5_PROMPT_V1\]/);
-  assert.match(exported, /^\\\[CHARACTER\]$/m);
-  assert.match(exported, /^\\\\literal$/m);
+  assert.match(exported, /^\\literal$/m);
   assert.deepEqual(parseNai5PromptText(exported), expected);
   assert.deepEqual(parseNai5PromptText(`\`\`\`text\n${exported}\n\`\`\``), expected);
   assert.match(formatNai5PromptText('base', [
     { prompt: 'rounded', position: { x: 0.1236, y: 0.5004 } },
   ]), /^0\.124, 0\.5$/m);
+  assert.throws(() => formatNai5PromptText('literal [CHARACTER]', []), /不能包含保留标记/);
 });
 
 test('rejects malformed NAI5 prompt input before applying it', () => {
