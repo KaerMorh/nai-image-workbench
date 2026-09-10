@@ -18,9 +18,15 @@ NovelAI 空闲时，Generate 仍然是原来的 Generate，行为完全不变。
 
 <!-- 图片预留：docs/images/queue-panel.png -->
 
+## NAI5 Prompt 导入/导出
+
+“特殊功能”中的“Prompt 导入/导出”可以交换 NAI5 的 Base Prompt、最多 20 个 Character 正面提示词，以及每个 Character 的一个中心位置。导入会整体替换现有 Character，并可撤销一次；负面提示词和其他生成参数不会写入交换文本。
+
+面板顶部的“导入/导出”按钮单击会打开工具，双击会直接复制当前配置。文本使用 `[NAI5_PROMPT_V1]` 标记格式，完整语法与转义规则见 [NAI5 Prompt 格式规范](docs/NAI5_PROMPT_V1.md)。读取、校验和应用表单均不会触发图片生成。
+
 ## 批量 Prompt 替换
 
-在 Base Prompt 中放入一个占位符：
+在“特殊功能”中的“批量替换”里使用。先在 Base Prompt 中放入一个占位符：
 
 ```text
 1girl, {{artist}}, portrait

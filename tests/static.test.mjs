@@ -8,6 +8,21 @@ const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const versionManifest = JSON.parse(await readFile(new URL('../version.json', import.meta.url), 'utf8'));
 
+function loadPromptFormatFunctions() {
+  const start = source.indexOf('function promptFormatError');
+  const end = source.indexOf('async function copyTextToClipboard');
+  assert.ok(start >= 0 && end > start, 'prompt format implementation must remain extractable');
+  const implementation = source.slice(start, end);
+  return new Function(`
+    const MAX_NAI5_PROMPT_CHARACTERS = 20;
+    const NAI5_PROMPT_MARKERS = new Set([
+      '[NAI5_PROMPT_V1]', '[MAIN]', '[CHARACTER]', '[POSITION]', '[PROMPT]', '[END]',
+    ]);
+    ${implementation}
+    return { parseNai5PromptText, formatNai5PromptText };
+  `)();
+}
+
 test('keeps the public name and release version aligned', () => {
   assert.match(source, /@name\s+NAI Image Workbench/);
   assert.match(source, new RegExp(`@version\\s+${packageJson.version.replaceAll('.', '\\.')}`));
@@ -251,17 +266,73 @@ test('persists configurable queue behavior behind a settings panel', () => {
   assert.doesNotMatch(source, /\.panel\.collapsed \{ width:/);
 });
 
-test('exports visible Base Prompt and Character textboxes without generation capture', () => {
+test('imports and exports the versioned NAI5 positive-prompt format', () => {
   assert.match(source, /class="prompt-export"/);
-  assert.match(source, />导出<\/button>/);
-  assert.match(source, /function readPromptTextboxes\(\)/);
-  assert.match(source, /\.ProseMirror\[contenteditable="true"\]/);
-  assert.match(source, /negative\|undesired/);
-  assert.match(source, /character\|角色\|人物/);
-  assert.match(source, /'Base Prompt:'/);
-  assert.match(source, /`Character\$\{index \+ 1\}:`/);
+  assert.match(source, />导入\/导出<\/button>/);
+  assert.match(source, /function parseNai5PromptText\(source\)/);
+  assert.match(source, /function formatNai5PromptText\(basePrompt, characters = \[\]\)/);
+  assert.match(source, /function captureNai5PromptForm\(\)/);
+  assert.match(source, /function commitPromptFormValues\(store, staged\)/);
+  assert.match(source, /lastPromptImportUndo/);
+  assert.match(source, /data-special-tab="prompt"/);
+  assert.match(source, /class="prompt-import-apply primary"/);
+  assert.match(source, /class="prompt-import-undo"/);
+  assert.match(source, /class="prompt-export-current"/);
+  assert.match(source, /class="prompt-copy-requirements"/);
+  assert.match(source, /请以 Markdown 形式输出，并使用 text 代码块包裹完整内容。/);
+  assert.match(source, /addEventListener\('dblclick'/);
   assert.match(source, /navigator\.clipboard\?\.writeText/);
   assert.match(source, /document\.execCommand\('copy'\)/);
+  const captureStart = source.indexOf('async function captureNai5PromptForm');
+  const captureEnd = source.indexOf('function normalizeExportCharacters', captureStart);
+  const promptCapture = source.slice(captureStart, captureEnd);
+  assert.doesNotMatch(promptCapture, /\.dispatch\(|\.activate\(|originalMethod/);
+});
+
+test('round-trips multiline prompts, reserved markers, backslashes, and positions', () => {
+  const { parseNai5PromptText, formatNai5PromptText } = loadPromptFormatFunctions();
+  const expected = {
+    main: 'scene line\n[CHARACTER]\n\\literal',
+    characters: [
+      { prompt: 'girl-A\n[PROMPT]', position: { x: 0.506, y: 0.102 } },
+      { prompt: 'girl-B', position: { x: 1, y: 0 } },
+    ],
+  };
+  const exported = formatNai5PromptText(expected.main, expected.characters);
+  assert.match(exported, /^\[NAI5_PROMPT_V1\]/);
+  assert.match(exported, /^\\\[CHARACTER\]$/m);
+  assert.match(exported, /^\\\\literal$/m);
+  assert.deepEqual(parseNai5PromptText(exported), expected);
+  assert.deepEqual(parseNai5PromptText(`\`\`\`text\n${exported}\n\`\`\``), expected);
+  assert.match(formatNai5PromptText('base', [
+    { prompt: 'rounded', position: { x: 0.1236, y: 0.5004 } },
+  ]), /^0\.124, 0\.5$/m);
+});
+
+test('rejects malformed NAI5 prompt input before applying it', () => {
+  const { parseNai5PromptText } = loadPromptFormatFunctions();
+  const prefix = '[NAI5_PROMPT_V1]\n\n[MAIN]\nbase\n\n[CHARACTER]\n[POSITION]\n';
+  assert.throws(() => parseNai5PromptText(`${prefix}1.1, 0.5\n[PROMPT]\ngirl\n[END]`), /0 到 1/);
+  assert.throws(() => parseNai5PromptText(`${prefix}0.1234, 0.5\n[PROMPT]\ngirl\n[END]`), /最多保留三位小数/);
+  assert.throws(() => parseNai5PromptText(`${prefix}0.5, 0.5\n0.2, 0.2\n[PROMPT]\ngirl\n[END]`), /只能有一个坐标/);
+  assert.throws(() => parseNai5PromptText(`${prefix}0.5, 0.5\n[PROMPT]\n\n[END]`), /缺少正面提示词/);
+  assert.throws(() => parseNai5PromptText('[NAI5_PROMPT_V1]\n[MAIN]\nbase\n[END]\nextra'), /\[END\] 后/);
+  const characters = Array.from({ length: 21 }, (_, index) => (
+    `[CHARACTER]\n[POSITION]\n0.5, 0.5\n[PROMPT]\ncharacter ${index + 1}`
+  )).join('\n');
+  assert.throws(() => parseNai5PromptText(`[NAI5_PROMPT_V1]\n[MAIN]\nbase\n${characters}\n[END]`), /不能超过 20/);
+});
+
+test('normalizes rich-text spaces and compact inline markers on import', () => {
+  const { parseNai5PromptText } = loadPromptFormatFunctions();
+  const pasted = `[NAI5\\_PROMPT\\_V1]\n[MAIN]&#x20;\nJapanese&#x20;\n\n[CHARACTER]&#x20;\n[POSITION]&#x20;\n0.36, 0.56&#x20;\n[PROMPT] Jeanette,&#x20;\n[CHARACTER] [POSITION] 0.70, 0.50 [PROMPT] fake plumber, t\n\n[END]`;
+  assert.deepEqual(parseNai5PromptText(pasted), {
+    main: 'Japanese',
+    characters: [
+      { position: { x: 0.36, y: 0.56 }, prompt: 'Jeanette,' },
+      { position: { x: 0.7, y: 0.5 }, prompt: 'fake plumber, t' },
+    ],
+  });
 });
 
 test('watches SPA navigation and gates the workbench to the image route', () => {
@@ -339,7 +410,8 @@ test('warns before starting adjacent duplicate batch items with a fixed Seed', (
 });
 
 test('provides a dedicated editable batch UI with pause, stop, retry, skip, and refresh controls', () => {
-  assert.match(source, /data-tab="batch"/);
+  assert.match(source, /data-tab="special">特殊功能/);
+  assert.match(source, /data-special-tab="batch">批量替换/);
   assert.match(source, /class="batch-items"/);
   assert.match(source, /开始特殊生成/);
   assert.match(source, /重新读取配置/);

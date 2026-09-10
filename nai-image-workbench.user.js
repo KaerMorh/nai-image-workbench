@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.6.7
-// @description  Queue generations, run prompt replacement batches, and track History saves in NovelAI Image Generation.
+// @version      0.7.0
+// @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
 // @updateURL    https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.6.7';
+  const SCRIPT_VERSION = '0.7.0';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -34,6 +34,15 @@
   const BATCH_CONTROLLER_LOCK = 'nai-image-workbench-batch-controller-v1';
   const MAX_FINISHED = 100;
   const MAX_BATCH_ITEMS = 500;
+  const MAX_NAI5_PROMPT_CHARACTERS = 20;
+  const NAI5_PROMPT_MARKERS = new Set([
+    '[NAI5_PROMPT_V1]',
+    '[MAIN]',
+    '[CHARACTER]',
+    '[POSITION]',
+    '[PROMPT]',
+    '[END]',
+  ]);
   const GENERATION_TIMEOUT_MS = 120_000;
   const OWNER_STALE_MS = 150_000;
   const INTER_JOB_DELAY_MS = 1_000;
@@ -66,6 +75,7 @@
   let historyHighlightTimer = null;
   let historyInteractionUntil = 0;
   let batchEditTimer = null;
+  let promptExportClickTimer = null;
   let batchControllerTimer = null;
   let batchControllerRunning = false;
   let batchRuntimePlan = null;
@@ -74,6 +84,7 @@
   let cachedState = defaultState();
   let cachedBusy = null;
   let cachedUpdateInfo = null;
+  let lastPromptImportUndo = null;
   let idleJotaiBooleanAtoms = [];
   let snapshotProbeChain = Promise.resolve();
   let pendingDirectComparisonCapture = null;
@@ -100,6 +111,7 @@
       paused: false,
       collapsed: true,
       activeTab: 'queue',
+      specialTab: 'prompt',
       position: null,
       settingsPosition: null,
       revision: 0,
@@ -426,55 +438,156 @@
     return String(editors[0]?.innerText || editors[0]?.textContent || '').trim();
   }
 
-  function isVisiblePromptEditor(editor) {
-    if (!(editor instanceof HTMLElement)) return false;
-    const rect = editor.getBoundingClientRect();
-    const style = getComputedStyle(editor);
-    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  function promptFormatError(message, line = null) {
+    const error = new Error(line ? `第 ${line} 行：${message}` : message);
+    error.name = 'PromptFormatError';
+    return error;
   }
 
-  function promptEditorText(editor) {
-    return String(editor?.innerText || editor?.textContent || '').trim();
+  function unwrapPromptCodeFence(source) {
+    const trimmed = String(source ?? '').replace(/\r\n?/g, '\n').trim();
+    if (!trimmed.startsWith('```')) return trimmed;
+    const match = trimmed.match(/^```(?:text)?[ \t]*\n([\s\S]*?)\n```$/i);
+    if (!match) throw promptFormatError('Markdown 代码块不完整，或代码块外包含了其他内容。');
+    return match[1];
   }
 
-  function promptEditorContext(editor) {
-    const labels = [];
-    let node = editor?.parentElement;
-    for (let depth = 0; node && depth < 7; depth += 1, node = node.parentElement) {
-      const editableCount = node.querySelectorAll('.ProseMirror[contenteditable="true"]').length;
-      if (editableCount > 1) break;
-      const clone = node.cloneNode(true);
-      clone.querySelectorAll('.ProseMirror, [contenteditable="true"], textarea, input').forEach((field) => field.remove());
-      const label = normalizeWhitespace(clone.textContent);
-      if (label && !labels.includes(label)) labels.push(label);
-    }
-    return labels.join(' ');
-  }
-
-  function readPromptTextboxes() {
-    const editors = Array.from(document.querySelectorAll('.ProseMirror[contenteditable="true"]'))
-      .filter(isVisiblePromptEditor);
-    const baseEditor = editors[0] || null;
-    const characterPrompts = [];
-    for (const editor of editors.slice(1)) {
-      const value = promptEditorText(editor);
-      if (!value) continue;
-      const context = promptEditorContext(editor);
-      if (/(?:negative|undesired|uc\b|负面|不希望|排除)/i.test(context)) continue;
-      if (/(?:character|角色|人物)/i.test(context)) characterPrompts.push(value);
-    }
-    return {
-      basePrompt: promptEditorText(baseEditor),
-      characterPrompts,
-    };
-  }
-
-  function formatPromptExport(basePrompt, characterPrompts) {
-    const lines = ['```', 'Base Prompt:', basePrompt, '---'];
-    characterPrompts.forEach((prompt, index) => {
-      lines.push(`Character${index + 1}:`, prompt, '---');
+  function normalizeNai5PromptImportLines(source) {
+    const markerPattern = /(?<!\\)\[(?:NAI5_PROMPT_V1|MAIN|CHARACTER|POSITION|PROMPT|END)\]/g;
+    return String(source ?? '').split('\n').flatMap((rawLine) => {
+      const line = rawLine
+        .replace(/(?:&#x20;|&#32;|&#xa0;|&#160;|&nbsp;)/gi, ' ')
+        .replace(/\[NAI5\\_PROMPT\\_V1\]/g, '[NAI5_PROMPT_V1]')
+        .replace(/[ \t]+$/g, '');
+      const trimmed = line.trim();
+      if (NAI5_PROMPT_MARKERS.has(trimmed)) return [trimmed];
+      const matches = Array.from(line.matchAll(markerPattern));
+      if (!matches.length) return [line];
+      const parts = [];
+      let cursor = 0;
+      for (const match of matches) {
+        const content = line.slice(cursor, match.index).trim();
+        if (content) parts.push(content);
+        parts.push(match[0]);
+        cursor = match.index + match[0].length;
+      }
+      const content = line.slice(cursor).trim();
+      if (content) parts.push(content);
+      return parts;
     });
-    lines.push('```');
+  }
+
+  function unescapePromptLine(line) {
+    if (!line.startsWith('\\')) return line;
+    const unescaped = line.slice(1);
+    return unescaped.startsWith('\\') || NAI5_PROMPT_MARKERS.has(unescaped) ? unescaped : line;
+  }
+
+  function trimPromptLines(lines) {
+    let start = 0;
+    let end = lines.length;
+    while (start < end && lines[start].trim() === '') start += 1;
+    while (end > start && lines[end - 1].trim() === '') end -= 1;
+    return lines.slice(start, end).map(unescapePromptLine).join('\n');
+  }
+
+  function parseNai5PromptText(source) {
+    const text = unwrapPromptCodeFence(source);
+    const lines = normalizeNai5PromptImportLines(text);
+    let index = 0;
+    const skipEmpty = () => {
+      while (index < lines.length && lines[index].trim() === '') index += 1;
+    };
+    const expect = (marker, message) => {
+      skipEmpty();
+      if (lines[index] !== marker) throw promptFormatError(message || `需要 ${marker}。`, index + 1);
+      index += 1;
+    };
+    const readUntil = (stops, label) => {
+      const start = index;
+      while (index < lines.length && !NAI5_PROMPT_MARKERS.has(lines[index])) index += 1;
+      if (index >= lines.length) throw promptFormatError(`${label} 后缺少 [END]。`, lines.length || 1);
+      if (!stops.has(lines[index])) {
+        throw promptFormatError(`${label} 后不能出现 ${lines[index]}。`, index + 1);
+      }
+      return trimPromptLines(lines.slice(start, index));
+    };
+
+    expect('[NAI5_PROMPT_V1]', '首个非空行必须是 [NAI5_PROMPT_V1]。');
+    expect('[MAIN]', '[NAI5_PROMPT_V1] 后必须是 [MAIN]。');
+    const main = readUntil(new Set(['[CHARACTER]', '[END]']), '[MAIN]');
+    const characters = [];
+
+    while (lines[index] === '[CHARACTER]') {
+      if (characters.length >= MAX_NAI5_PROMPT_CHARACTERS) {
+        throw promptFormatError(`Character 不能超过 ${MAX_NAI5_PROMPT_CHARACTERS} 个。`, index + 1);
+      }
+      const characterNumber = characters.length + 1;
+      index += 1;
+      expect('[POSITION]', `Character ${characterNumber} 缺少 [POSITION]。`);
+      skipEmpty();
+      const coordinateLine = index + 1;
+      const coordinateText = lines[index] || '';
+      if (NAI5_PROMPT_MARKERS.has(coordinateText) || !coordinateText.trim()) {
+        throw promptFormatError(`Character ${characterNumber} 缺少位置坐标。`, coordinateLine);
+      }
+      index += 1;
+      const coordinateMatch = coordinateText.match(/^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*$/);
+      if (!coordinateMatch) {
+        throw promptFormatError(`Character ${characterNumber} 的位置必须是两个以逗号分隔的有效数字。`, coordinateLine);
+      }
+      const decimalPlaces = (value) => (value.includes('.') ? value.split('.')[1].length : 0);
+      if (decimalPlaces(coordinateMatch[1]) > 3 || decimalPlaces(coordinateMatch[2]) > 3) {
+        throw promptFormatError(`Character ${characterNumber} 的 x 和 y 最多保留三位小数。`, coordinateLine);
+      }
+      const x = Number(coordinateMatch[1]);
+      const y = Number(coordinateMatch[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+        throw promptFormatError(`Character ${characterNumber} 的 x 和 y 必须在 0 到 1 之间。`, coordinateLine);
+      }
+      expect('[PROMPT]', `Character ${characterNumber} 的位置后必须是 [PROMPT]，且只能有一个坐标。`);
+      const prompt = readUntil(new Set(['[CHARACTER]', '[END]']), `Character ${characterNumber} 的 [PROMPT]`);
+      if (!prompt.trim()) throw promptFormatError(`Character ${characterNumber} 缺少正面提示词。`, index + 1);
+      characters.push({ position: { x, y }, prompt });
+    }
+
+    if (lines[index] !== '[END]') throw promptFormatError('所有 Character 后必须是 [END]。', index + 1);
+    index += 1;
+    skipEmpty();
+    if (index < lines.length) throw promptFormatError('[END] 后不允许有其他内容。', index + 1);
+    return { main, characters };
+  }
+
+  function escapePromptText(value) {
+    return String(value ?? '').replace(/\r\n?/g, '\n').split('\n').map((line) => (
+      line.startsWith('\\') || NAI5_PROMPT_MARKERS.has(line) ? `\\${line}` : line
+    )).join('\n');
+  }
+
+  function formatCoordinate(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0 || number > 1) throw new Error('Character 坐标必须在 0 到 1 之间。');
+    const rounded = Math.round((number + Number.EPSILON) * 1_000) / 1_000;
+    return String(Object.is(rounded, -0) ? 0 : rounded);
+  }
+
+  function formatNai5PromptText(basePrompt, characters = []) {
+    if (characters.length > MAX_NAI5_PROMPT_CHARACTERS) {
+      throw new Error(`Character 不能超过 ${MAX_NAI5_PROMPT_CHARACTERS} 个。`);
+    }
+    const lines = ['[NAI5_PROMPT_V1]', '', '[MAIN]', escapePromptText(basePrompt)];
+    for (const character of characters) {
+      if (!String(character?.prompt ?? '').trim()) throw new Error('Character 缺少正面提示词。');
+      lines.push(
+        '',
+        '[CHARACTER]',
+        '[POSITION]',
+        `${formatCoordinate(character?.position?.x)}, ${formatCoordinate(character?.position?.y)}`,
+        '[PROMPT]',
+        escapePromptText(character.prompt),
+      );
+    }
+    lines.push('', '[END]');
     return lines.join('\n');
   }
 
@@ -497,16 +610,6 @@
     const copied = document.execCommand('copy');
     textarea.remove();
     if (!copied) throw new Error('浏览器拒绝了剪贴板写入。');
-  }
-
-  async function exportPromptTextboxes() {
-    const { basePrompt, characterPrompts } = readPromptTextboxes();
-    if (!basePrompt) {
-      notify('没有找到可导出的 Base Prompt 文本。', 'error');
-      return;
-    }
-    await copyTextToClipboard(formatPromptExport(basePrompt, characterPrompts));
-    notify(`Prompt 已复制${characterPrompts.length ? `，包含 ${characterPrompts.length} 个 Character` : ''}。`, 'success');
   }
 
   function normalizeWhitespace(value) {
@@ -1502,6 +1605,209 @@
         for (const operation of pendingSets) busyAccess.store.set(operation.atom, ...operation.args);
       },
     };
+  }
+
+  function isNai5Model(model) {
+    return /^nai-diffusion-5(?:-|$)/i.test(String(model || ''));
+  }
+
+  function findValuePath(root, predicate, depth = 0, path = [], seen = new Set()) {
+    if (predicate(root, path)) return path;
+    if (!root || typeof root !== 'object' || depth >= 4 || seen.has(root)) return null;
+    seen.add(root);
+    const entries = Array.isArray(root)
+      ? root.slice(0, 30).map((value, index) => [index, value])
+      : Object.entries(root).slice(0, 80);
+    for (const [key, value] of entries) {
+      const found = findValuePath(value, predicate, depth + 1, [...path, key], seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function valueAtPath(root, path) {
+    return path.reduce((value, key) => value?.[key], root);
+  }
+
+  function replaceValueAtPath(root, path, replacement) {
+    if (!path.length) return replacement;
+    const [key, ...rest] = path;
+    const copy = Array.isArray(root) ? [...root] : { ...root };
+    copy[key] = replaceValueAtPath(root?.[key], rest, replacement);
+    return copy;
+  }
+
+  function locatePromptFormAtoms(preparedCallback, options) {
+    const snapshots = Array.from(preparedCallback.atomSnapshot, ([atom, value]) => ({ atom, value }));
+    const expectedPrompt = String(options?.prompt ?? readNativeBasePrompt());
+    let characterIndex = snapshots.findIndex(({ value }) => value === options?.characterPrompts);
+    if (characterIndex < 0 && Array.isArray(options?.characterPrompts)) {
+      characterIndex = snapshots.findIndex(({ value }) => {
+        if (!Array.isArray(value) || value.length !== options.characterPrompts.length) return false;
+        return value.every((character, index) => character === options.characterPrompts[index]);
+      });
+    }
+    const characterSnapshot = characterIndex >= 0 ? snapshots[characterIndex] : null;
+    const characterAccess = characterSnapshot ? { ...characterSnapshot, path: [] } : null;
+
+    let promptAccess = snapshots.find(({ value }) => typeof value === 'string' && value === expectedPrompt);
+    if (!expectedPrompt && characterIndex >= 0) {
+      const negativePrompt = String(options?.negPrompt ?? '');
+      let negativeIndex = -1;
+      for (let index = characterIndex - 1; index >= 0; index -= 1) {
+        if (snapshots[index].value === negativePrompt) {
+          negativeIndex = index;
+          break;
+        }
+      }
+      for (let index = negativeIndex - 1; index >= 0; index -= 1) {
+        if (snapshots[index].value === expectedPrompt) {
+          promptAccess = snapshots[index];
+          break;
+        }
+      }
+    }
+    if (promptAccess) promptAccess = { ...promptAccess, path: [] };
+    if (!promptAccess) {
+      for (const snapshot of snapshots) {
+        const path = findValuePath(snapshot.value, (value, candidatePath) => {
+          const key = String(candidatePath.at(-1) ?? '');
+          return typeof value === 'string' && value === expectedPrompt && /^(?:prompt|basePrompt|base_prompt)$/i.test(key);
+        });
+        if (path) {
+          promptAccess = { ...snapshot, path };
+          break;
+        }
+      }
+    }
+
+    const paramsSnapshot = snapshots.find(({ value }) => (
+      value && typeof value === 'object' && !Array.isArray(value)
+        && Object.prototype.hasOwnProperty.call(value, 'use_coords')
+    ));
+    const paramsAccess = paramsSnapshot ? { ...paramsSnapshot, path: [] } : null;
+    if (!promptAccess || !characterAccess || !paramsAccess) {
+      throw new Error('无法定位 NovelAI 的 Base Prompt 或 Character 状态；页面结构可能已经更新。');
+    }
+    return { promptAccess, characterAccess, paramsAccess };
+  }
+
+  async function captureNai5PromptForm() {
+    const button = findGenerateButton();
+    if (!button) throw new Error('没有找到 NovelAI 的 Generate 按钮。');
+    rememberIdleJotaiAtoms(button);
+    const busyAccess = temporarilyReleaseNovelAIBusy(button);
+    const preparedCallback = busyAccess ? prepareCurrentGenerationCallback(button, busyAccess, false) : null;
+    if (!preparedCallback) throw new Error('当前 NovelAI 表单尚未准备好，请稍后再试。');
+    const invocation = await (snapshotProbeChain = snapshotProbeChain
+      .catch(() => undefined)
+      .then(() => captureGenerationInvocation(preparedCallback, busyAccess, { force: false })));
+    if (!invocation) throw new Error('无法读取当前 NovelAI 表单。');
+    const options = invocation.args[0] || {};
+    if (!isNai5Model(options.model)) throw new Error('Prompt 导入/导出仅支持当前选择的 NAI5 模型。');
+    const accesses = locatePromptFormAtoms(preparedCallback, options);
+    return { store: busyAccess.store, model: options.model, ...accesses };
+  }
+
+  function normalizeExportCharacters(params) {
+    const characterPrompts = params?.characterPrompts;
+    if (!Array.isArray(characterPrompts)) throw new Error('无法读取 Character Prompt。');
+    if (characterPrompts.length > MAX_NAI5_PROMPT_CHARACTERS) {
+      throw new Error(`Character 不能超过 ${MAX_NAI5_PROMPT_CHARACTERS} 个。`);
+    }
+    return characterPrompts.map((character, index) => {
+      const x = Number(character?.center?.x);
+      const y = Number(character?.center?.y);
+      const prompt = String(character?.prompt ?? '');
+      if (!prompt.trim()) throw new Error(`Character ${index + 1} 缺少正面提示词。`);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+        throw new Error(`Character ${index + 1} 没有一个有效的中心位置。`);
+      }
+      return { prompt, position: { x, y } };
+    });
+  }
+
+  async function readCurrentNai5Prompt() {
+    const access = await captureNai5PromptForm();
+    const main = String(valueAtPath(access.promptAccess.value, access.promptAccess.path) ?? '');
+    const characterPrompts = valueAtPath(access.characterAccess.value, access.characterAccess.path);
+    return { access, data: { main, characters: normalizeExportCharacters({ characterPrompts }) } };
+  }
+
+  function stagePromptFormValues(access, data) {
+    const staged = new Map();
+    const stage = (target, replacement) => {
+      const root = staged.has(target.atom) ? staged.get(target.atom) : target.value;
+      staged.set(target.atom, replaceValueAtPath(root, target.path, replacement));
+    };
+    stage(access.promptAccess, data.main);
+    stage(access.characterAccess, data.characters.map((character) => ({
+      prompt: character.prompt,
+      uc: '',
+      center: { x: character.position.x, y: character.position.y },
+      enabled: true,
+    })));
+    const oldParams = valueAtPath(access.paramsAccess.value, access.paramsAccess.path);
+    const params = {
+      ...oldParams,
+      use_coords: data.characters.length > 0,
+    };
+    stage(access.paramsAccess, params);
+    return staged;
+  }
+
+  function commitPromptFormValues(store, staged) {
+    const previous = new Map();
+    const applied = [];
+    try {
+      for (const [atom, value] of staged) {
+        previous.set(atom, store.get(atom));
+        store.set(atom, value);
+        applied.push(atom);
+      }
+    } catch (error) {
+      for (const atom of applied.reverse()) {
+        try { store.set(atom, previous.get(atom)); } catch { /* Keep the original write error. */ }
+      }
+      throw error;
+    }
+    return previous;
+  }
+
+  async function applyNai5PromptText(source) {
+    const data = parseNai5PromptText(source);
+    const access = await captureNai5PromptForm();
+    const staged = stagePromptFormValues(access, data);
+    const previous = commitPromptFormValues(access.store, staged);
+    lastPromptImportUndo = { store: access.store, previous };
+    return data;
+  }
+
+  function undoNai5PromptImport() {
+    if (!lastPromptImportUndo) throw new Error('没有可撤销的 Prompt 导入。');
+    const { store, previous } = lastPromptImportUndo;
+    const rollback = new Map();
+    const applied = [];
+    try {
+      for (const [atom, value] of previous) {
+        rollback.set(atom, store.get(atom));
+        store.set(atom, value);
+        applied.push(atom);
+      }
+    } catch (error) {
+      for (const atom of applied.reverse()) {
+        try { store.set(atom, rollback.get(atom)); } catch { /* Keep the original undo error. */ }
+      }
+      throw error;
+    }
+    lastPromptImportUndo = null;
+  }
+
+  async function exportNai5PromptToClipboard() {
+    const { data } = await readCurrentNai5Prompt();
+    await copyTextToClipboard(formatNai5PromptText(data.main, data.characters));
+    notify(`Prompt 已复制${data.characters.length ? `，包含 ${data.characters.length} 个 Character` : ''}。`, 'success');
+    return data;
   }
 
   function refreshInvocationRuntimeCallbacks(snapshot, fresh) {
@@ -2796,7 +3102,7 @@
         updatedAt: now(),
       });
       batchRuntimePlan = { ...plan, batchId: id };
-      await saveState({ activeTab: 'batch', batch });
+      await saveState({ activeTab: 'special', specialTab: 'batch', batch });
       scheduleRefresh();
       await dispatchBatchRuntimePlan(batchRuntimePlan, batch, current, 'batch-start');
     } catch (error) {
@@ -3395,6 +3701,60 @@
     scheduleRefresh();
   }
 
+  function promptFormatRequirementsText() {
+    return [
+      '[NAI5_PROMPT_V1]',
+      '',
+      '[MAIN]',
+      '主正面提示词',
+      '',
+      '[CHARACTER]',
+      '[POSITION]',
+      '0.5, 0.5',
+      '[PROMPT]',
+      'Character 正面提示词',
+      '',
+      '[END]',
+      '',
+      '请以 Markdown 形式输出，并使用 text 代码块包裹完整内容。',
+      `规则：0–${MAX_NAI5_PROMPT_CHARACTERS} 个 Character；每个 Character 恰好一个 x, y 坐标，x/y 范围均为 0–1，最多三位小数；只导入正面提示词。`,
+      '提示词中的保留标记独占一行时，在行首添加反斜杠；原本以反斜杠开头的行也再添加一个反斜杠。',
+    ].join('\n');
+  }
+
+  async function openPromptTools() {
+    if (promptExportClickTimer) nativeClearTimeout(promptExportClickTimer);
+    promptExportClickTimer = null;
+    await saveState({ collapsed: false, activeTab: 'special', specialTab: 'prompt' });
+    scheduleRefresh();
+  }
+
+  function renderPromptImportUi() {
+    if (!shadow) return;
+    const textarea = shadow.querySelector('.prompt-import-text');
+    const validation = shadow.querySelector('.prompt-import-validation');
+    const applyButton = shadow.querySelector('.prompt-import-apply');
+    const undoButton = shadow.querySelector('.prompt-import-undo');
+    const source = textarea.value;
+    if (!source.trim()) {
+      validation.textContent = '粘贴 NAI5_PROMPT_V1 文本后会先在本地完整校验。';
+      validation.classList.remove('error');
+      applyButton.disabled = true;
+    } else {
+      try {
+        const parsed = parseNai5PromptText(source);
+        validation.textContent = `格式有效：主提示词 + ${parsed.characters.length} 个 Character。`;
+        validation.classList.remove('error');
+        applyButton.disabled = false;
+      } catch (error) {
+        validation.textContent = error.message || String(error);
+        validation.classList.add('error');
+        applyButton.disabled = true;
+      }
+    }
+    undoButton.disabled = !lastPromptImportUndo;
+  }
+
   function buildUi() {
     if (document.getElementById('nai-image-workbench-host')) return;
     uiHost = document.createElement('div');
@@ -3430,6 +3790,8 @@
         .tabs { display: grid; grid-template-columns: 1fr 1fr 1.15fr; gap: 6px; padding: 8px 10px 0; }
         .tabs button span { margin-left: 9px; }
         .tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
+        .special-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 9px; }
+        .special-tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
         .body { min-height: 140px; overflow: auto; padding: 8px 10px 10px; }
         .view[hidden] { display: none; }
         .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 8px; }
@@ -3450,7 +3812,12 @@
         .badges span { padding: 2px 6px; color: #d8dcff; background: #2a315a; border-radius: 999px; font-size: 10px; }
         .job-error { margin-top: 6px; color: #ffb6bf; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
-        .batch-view { display: flex; flex-direction: column; gap: 9px; }
+        .special-view, .special-subview, .batch-view, .prompt-import-view { display: flex; flex-direction: column; gap: 9px; }
+        .special-subview[hidden] { display: none; }
+        .prompt-import-text { width: 100%; min-height: 230px; resize: vertical; padding: 8px 9px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 7px; font: 12px/1.45 ui-monospace, Consolas, monospace; }
+        .prompt-import-validation { color: #aeb5da; font-size: 12px; overflow-wrap: anywhere; }
+        .prompt-import-validation.error { color: #ffabb7; }
+        .prompt-import-help { color: #969dc7; font-size: 11px; }
         .batch-box { padding: 9px; color: #dce0ff; background: #191d3a; border: 1px solid #363d66; border-radius: 8px; }
         .batch-box strong { color: #f5f3c2; }
         .batch-box small { display: block; margin-top: 4px; color: #969dc7; }
@@ -3507,7 +3874,7 @@
         <header class="header">
           <div class="title">NAI Image Workbench</div>
           <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">禁用</button>
-          <button class="prompt-export" type="button" title="复制当前 Base Prompt 和 Character Prompt">导出</button>
+          <button class="prompt-export" type="button" title="单击打开导入/导出；双击直接复制当前 NAI5 Prompt">导入/导出</button>
           <button class="settings" type="button">设置</button>
           <button class="collapse" type="button" title="展开面板" aria-label="展开面板">+</button>
         </header>
@@ -3515,7 +3882,7 @@
         <nav class="tabs">
           <button type="button" data-tab="queue">队列<span class="queue-count">0</span></button>
           <button type="button" data-tab="finished">已结束<span class="finished-count">0</span></button>
-          <button type="button" data-tab="batch">批量替换<span class="batch-count">0</span></button>
+          <button type="button" data-tab="special">特殊功能<span class="batch-count">0</span></button>
         </nav>
         <div class="body">
           <div class="queue-view view">
@@ -3524,29 +3891,48 @@
             </div>
             <div class="list"></div>
           </div>
-          <div class="batch-view view" hidden>
-            <div class="batch-box batch-template"></div>
-            <div class="batch-box batch-current" hidden></div>
-            <div class="batch-box batch-error" hidden></div>
-            <label class="batch-items-label"><span>剩余替换单位（每行一个）</span><span class="batch-item-count">0/500</span></label>
-            <textarea class="batch-items" spellcheck="false" placeholder="taromarun&#10;piromizu&#10;xilmo&#10;kamo_kamen&#10;sharpffffff"></textarea>
-            <div class="batch-validation"></div>
-            <ol class="batch-preview"></ol>
-            <div class="batch-controls batch-main-controls">
-              <button class="batch-start primary" type="button">开始特殊生成</button>
-              <button class="batch-pause" type="button">暂停</button>
-              <button class="batch-stop" type="button">停止</button>
+          <div class="special-view view" hidden>
+            <nav class="special-tabs">
+              <button type="button" data-special-tab="prompt">Prompt 导入/导出</button>
+              <button type="button" data-special-tab="batch">批量替换</button>
+            </nav>
+            <div class="prompt-import-view special-subview">
+              <textarea class="prompt-import-text" spellcheck="false" placeholder="[NAI5_PROMPT_V1]&#10;&#10;[MAIN]&#10;主正面提示词&#10;&#10;[CHARACTER]&#10;[POSITION]&#10;0.5, 0.5&#10;[PROMPT]&#10;Character 正面提示词&#10;&#10;[END]"></textarea>
+              <div class="prompt-import-validation"></div>
+              <div class="batch-controls">
+                <button class="prompt-import-apply primary" type="button">应用导入</button>
+                <button class="prompt-import-undo" type="button">撤销导入</button>
+              </div>
+              <div class="batch-controls">
+                <button class="prompt-export-current" type="button">导出当前</button>
+                <button class="prompt-copy-requirements" type="button">复制格式要求</button>
+              </div>
+              <small class="prompt-import-help">只处理 NAI5 的 Base Prompt、Character 正面提示词和单一中心位置；不会触发生成。</small>
             </div>
-            <div class="batch-controls">
-              <button class="batch-recapture" type="button">重新读取配置</button>
-              <button class="batch-clear danger" type="button">清空剩余</button>
-            </div>
-            <div class="batch-controls batch-failure-controls" hidden>
-              <button class="batch-retry primary" type="button">重试当前项</button>
-              <button class="batch-skip danger" type="button">跳过并删除当前项</button>
-            </div>
-            <div class="batch-controls batch-running-controls" hidden>
-              <button class="batch-discard danger" type="button">完成后丢弃记录并停止</button>
+            <div class="batch-view special-subview" hidden>
+              <div class="batch-box batch-template"></div>
+              <div class="batch-box batch-current" hidden></div>
+              <div class="batch-box batch-error" hidden></div>
+              <label class="batch-items-label"><span>剩余替换单位（每行一个）</span><span class="batch-item-count">0/500</span></label>
+              <textarea class="batch-items" spellcheck="false" placeholder="taromarun&#10;piromizu&#10;xilmo&#10;kamo_kamen&#10;sharpffffff"></textarea>
+              <div class="batch-validation"></div>
+              <ol class="batch-preview"></ol>
+              <div class="batch-controls batch-main-controls">
+                <button class="batch-start primary" type="button">开始特殊生成</button>
+                <button class="batch-pause" type="button">暂停</button>
+                <button class="batch-stop" type="button">停止</button>
+              </div>
+              <div class="batch-controls">
+                <button class="batch-recapture" type="button">重新读取配置</button>
+                <button class="batch-clear danger" type="button">清空剩余</button>
+              </div>
+              <div class="batch-controls batch-failure-controls" hidden>
+                <button class="batch-retry primary" type="button">重试当前项</button>
+                <button class="batch-skip danger" type="button">跳过并删除当前项</button>
+              </div>
+              <div class="batch-controls batch-running-controls" hidden>
+                <button class="batch-discard danger" type="button">完成后丢弃记录并停止</button>
+              </div>
             </div>
           </div>
         </div>
@@ -3588,10 +3974,15 @@
     document.documentElement.append(uiHost);
 
     shadow.querySelector('.queue-toggle').addEventListener('click', () => void toggleQueueControl());
-    shadow.querySelector('.prompt-export').addEventListener('click', () => {
-      void exportPromptTextboxes().catch((error) => {
-        notify(`导出失败：${error.message || error}`, 'error');
-      });
+    shadow.querySelector('.prompt-export').addEventListener('click', (event) => {
+      if (event.detail > 1) return;
+      if (promptExportClickTimer) nativeClearTimeout(promptExportClickTimer);
+      promptExportClickTimer = nativeSetTimeout(() => void openPromptTools(), 260);
+    });
+    shadow.querySelector('.prompt-export').addEventListener('dblclick', () => {
+      if (promptExportClickTimer) nativeClearTimeout(promptExportClickTimer);
+      promptExportClickTimer = null;
+      void exportNai5PromptToClipboard().catch((error) => notify(`导出失败：${error.message || error}`, 'error'));
     });
     shadow.querySelector('.settings').addEventListener('click', openSettings);
     shadow.querySelector('.settings-close').addEventListener('click', closeSettings);
@@ -3611,6 +4002,37 @@
         await saveState({ activeTab: button.dataset.tab });
         scheduleRefresh();
       });
+    });
+    shadow.querySelectorAll('[data-special-tab]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await saveState({ specialTab: button.dataset.specialTab });
+        scheduleRefresh();
+      });
+    });
+    shadow.querySelector('.prompt-import-text').addEventListener('input', renderPromptImportUi);
+    shadow.querySelector('.prompt-import-apply').addEventListener('click', () => {
+      const source = shadow.querySelector('.prompt-import-text').value;
+      void applyNai5PromptText(source).then((data) => {
+        notify(`Prompt 已应用，创建 ${data.characters.length} 个 Character。`, 'success');
+        renderPromptImportUi();
+      }).catch((error) => notify(`导入失败：${error.message || error}`, 'error'));
+    });
+    shadow.querySelector('.prompt-import-undo').addEventListener('click', () => {
+      try {
+        undoNai5PromptImport();
+        notify('已撤销上一次 Prompt 导入。', 'success');
+        renderPromptImportUi();
+      } catch (error) {
+        notify(`撤销失败：${error.message || error}`, 'error');
+      }
+    });
+    shadow.querySelector('.prompt-export-current').addEventListener('click', () => {
+      void exportNai5PromptToClipboard().catch((error) => notify(`导出失败：${error.message || error}`, 'error'));
+    });
+    shadow.querySelector('.prompt-copy-requirements').addEventListener('click', () => {
+      void copyTextToClipboard(promptFormatRequirementsText())
+        .then(() => notify('格式要求已复制。', 'success'))
+        .catch((error) => notify(`复制失败：${error.message || error}`, 'error'));
     });
     shadow.querySelector('.clear').addEventListener('click', () => void clearJobs(cachedState.activeTab === 'finished' ? 'finished' : 'queue'));
     shadow.querySelector('.batch-items').addEventListener('input', () => {
@@ -3883,8 +4305,15 @@
     shadow.querySelector('.batch-count').textContent = String(cachedState.batch.items.length + (cachedState.batch.current ? 1 : 0));
     shadow.querySelectorAll('[data-tab]').forEach((button) => button.classList.toggle('active', button.dataset.tab === cachedState.activeTab));
 
-    shadow.querySelector('.queue-view').hidden = cachedState.activeTab === 'batch';
-    shadow.querySelector('.batch-view').hidden = cachedState.activeTab !== 'batch';
+    const specialTab = ['prompt', 'batch'].includes(cachedState.specialTab) ? cachedState.specialTab : 'prompt';
+    shadow.querySelector('.queue-view').hidden = cachedState.activeTab === 'special';
+    shadow.querySelector('.special-view').hidden = cachedState.activeTab !== 'special';
+    shadow.querySelectorAll('[data-special-tab]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.specialTab === specialTab);
+    });
+    shadow.querySelector('.prompt-import-view').hidden = specialTab !== 'prompt';
+    shadow.querySelector('.batch-view').hidden = specialTab !== 'batch';
+    renderPromptImportUi();
     renderBatchUi(cachedState.batch);
 
     const shown = cachedState.activeTab === 'finished' ? finished : [...pendingSnapshots, ...queued];
