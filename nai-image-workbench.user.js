@@ -63,6 +63,7 @@
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(CHANNEL_NAME) : null;
 
   let dbPromise;
+  let dbConnection;
   let uiHost;
   let shadow;
   let imageRouteActive = false;
@@ -631,8 +632,10 @@
   }
 
   function openDatabase() {
+    if (dbConnection) return Promise.resolve(dbConnection);
     if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
+    let openingPromise;
+    openingPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
       request.onupgradeneeded = () => {
         const db = request.result;
@@ -649,27 +652,62 @@
           db.createObjectStore(BLOB_STORE, { keyPath: 'hash' });
         }
       };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        dbConnection = db;
+        db.onversionchange = () => {
+          if (dbConnection === db) dbConnection = null;
+          db.close();
+        };
+        db.onclose = () => {
+          if (dbConnection === db) dbConnection = null;
+        };
+        if (dbPromise === openingPromise) dbPromise = null;
+        resolve(db);
+      };
+      request.onerror = () => {
+        if (dbPromise === openingPromise) dbPromise = null;
+        reject(request.error);
+      };
     });
-    return dbPromise;
+    dbPromise = openingPromise;
+    return openingPromise;
+  }
+
+  function isClosingDatabaseError(error) {
+    return error?.name === 'InvalidStateError'
+      && /(?:connection|database).*(?:closing|closed)|(?:closing|closed).*(?:connection|database)/i.test(error.message || '');
+  }
+
+  function discardDatabaseConnection(db) {
+    if (dbConnection !== db) return;
+    dbConnection = null;
+    try { db.close(); } catch { /* The browser may already have closed it. */ }
+  }
+
+  async function withDatabase(operation) {
+    const db = await openDatabase();
+    try {
+      return await operation(db);
+    } catch (error) {
+      if (!isClosingDatabaseError(error)) throw error;
+      discardDatabaseConnection(db);
+      return operation(await openDatabase());
+    }
   }
 
   async function transaction(storeNames, mode, operation) {
-    const db = await openDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(storeNames, mode);
-      let result;
+    return withDatabase((db) => new Promise((resolve, reject) => {
       try {
-        result = operation(tx);
+        const tx = db.transaction(storeNames, mode);
+        const result = operation(tx);
+        tx.oncomplete = () => resolve(result);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted.'));
       } catch (error) {
         reject(error);
-        return;
       }
-      tx.oncomplete = () => resolve(result);
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted.'));
-    });
+    }));
   }
 
   function requestAsPromise(request) {
@@ -680,15 +718,17 @@
   }
 
   async function getAllJobs() {
-    const db = await openDatabase();
-    const tx = db.transaction(JOB_STORE, 'readonly');
-    return requestAsPromise(tx.objectStore(JOB_STORE).getAll());
+    return withDatabase((db) => {
+      const tx = db.transaction(JOB_STORE, 'readonly');
+      return requestAsPromise(tx.objectStore(JOB_STORE).getAll());
+    });
   }
 
   async function getJob(id) {
-    const db = await openDatabase();
-    const tx = db.transaction(JOB_STORE, 'readonly');
-    return requestAsPromise(tx.objectStore(JOB_STORE).get(id));
+    return withDatabase((db) => {
+      const tx = db.transaction(JOB_STORE, 'readonly');
+      return requestAsPromise(tx.objectStore(JOB_STORE).get(id));
+    });
   }
 
   async function putJob(job, { broadcast = true } = {}) {
@@ -699,19 +739,22 @@
   }
 
   async function updateJob(id, updater, { broadcast = true } = {}) {
-    const db = await openDatabase();
-    const tx = db.transaction(JOB_STORE, 'readwrite');
-    const store = tx.objectStore(JOB_STORE);
-    const existing = await requestAsPromise(store.get(id));
-    if (!existing) return null;
-    const updated = updater({ ...existing });
-    if (!updated) return existing;
-    store.put(updated);
-    await new Promise((resolve, reject) => {
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted.'));
+    const updated = await withDatabase(async (db) => {
+      const tx = db.transaction(JOB_STORE, 'readwrite');
+      const store = tx.objectStore(JOB_STORE);
+      const existing = await requestAsPromise(store.get(id));
+      if (!existing) return null;
+      const next = updater({ ...existing });
+      if (!next) return existing;
+      store.put(next);
+      await new Promise((resolve, reject) => {
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted.'));
+      });
+      return next;
     });
+    if (!updated) return null;
     if (broadcast) notifyPeers('jobs-changed');
     scheduleRefresh();
     return updated;
@@ -724,9 +767,10 @@
   }
 
   async function getMeta(key) {
-    const db = await openDatabase();
-    const tx = db.transaction(META_STORE, 'readonly');
-    const row = await requestAsPromise(tx.objectStore(META_STORE).get(key));
+    const row = await withDatabase((db) => {
+      const tx = db.transaction(META_STORE, 'readonly');
+      return requestAsPromise(tx.objectStore(META_STORE).get(key));
+    });
     return row?.value;
   }
 
@@ -867,9 +911,10 @@
       if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && value[BLOB_REF_KEY]) {
         const hash = value[BLOB_REF_KEY];
         if (!cache.has(hash)) {
-          const db = await openDatabase();
-          const tx = db.transaction(BLOB_STORE, 'readonly');
-          const row = await requestAsPromise(tx.objectStore(BLOB_STORE).get(hash));
+          const row = await withDatabase((db) => {
+            const tx = db.transaction(BLOB_STORE, 'readonly');
+            return requestAsPromise(tx.objectStore(BLOB_STORE).get(hash));
+          });
           if (!row) throw new Error(`Stored image data is missing (${hash.slice(0, 8)}).`);
           cache.set(hash, row.value);
         }
@@ -959,11 +1004,12 @@
     const referenced = new Set(jobs.flatMap(collectBlobRefsFromStoredBody));
     const batchTemplate = await getMeta('batch-template');
     for (const ref of collectBlobRefsFromStoredBody(batchTemplate || {})) referenced.add(ref);
-    const db = await openDatabase();
-    const tx = db.transaction(BLOB_STORE, 'readwrite');
-    const store = tx.objectStore(BLOB_STORE);
-    const keys = await requestAsPromise(store.getAllKeys());
-    for (const key of keys) if (!referenced.has(key)) store.delete(key);
+    await withDatabase(async (db) => {
+      const tx = db.transaction(BLOB_STORE, 'readwrite');
+      const store = tx.objectStore(BLOB_STORE);
+      const keys = await requestAsPromise(store.getAllKeys());
+      for (const key of keys) if (!referenced.has(key)) store.delete(key);
+    });
   }
 
   function countMeaningfulImages(value) {
