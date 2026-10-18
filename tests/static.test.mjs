@@ -290,6 +290,52 @@ test('imports and exports the versioned NAI5 positive-prompt format', () => {
   assert.doesNotMatch(promptCapture, /\.dispatch\(|\.activate\(|originalMethod/);
 });
 
+test('finds generation callbacks and API in React Compiler caches without invoking them', () => {
+  const start = source.indexOf('function readGenerationMemoValues');
+  const end = source.indexOf('async function captureGenerationInvocation', start);
+  const prepare = new Function('findGenerationComponentFiber', `${source.slice(start, end)}
+    return prepareCurrentGenerationCallback;
+  `);
+  let invocations = 0;
+  const normal = (get, set, force) => {
+    invocations += 1;
+    const plan = get({force:force});
+    return set(plan.start, plan.container, plan.onGenerated, plan.modifyImage);
+  };
+  const grid = (get) => {
+    invocations += 1;
+    return get({ gridXLength: 2, gridYLength: 2 });
+  };
+  const api = { generateNormal() { invocations += 1; } };
+  const atom = {};
+  const store = { get: () => 'current prompt' };
+  const atomHook = { memoizedState: ['stale prompt', store, atom], next: null };
+  for (const fiber of [
+    {
+      memoizedState: atomHook,
+      updateQueue: { memoCache: { data: [
+        [Symbol.for('react.memo_cache_sentinel'), grid],
+        [api, normal],
+      ] } },
+    },
+    {
+      memoizedState: {
+        memoizedState: [normal, []],
+        next: { memoizedState: [grid, []], next: { memoizedState: [api, []], next: atomHook } },
+      },
+    },
+  ]) {
+    const read = prepare(() => fiber);
+    const result = read({ innerText: 'Generate' }, { store }, false);
+    assert.equal(result.selected, normal);
+    assert.equal(result.generationApi, api);
+    assert.equal(result.atomSnapshot.get(atom), 'current prompt');
+    assert.equal(read({ innerText: 'Grid' }, { store }).selected, grid);
+  }
+  assert.equal(prepare(() => null)({}, { store }), null);
+  assert.equal(invocations, 0, 'discovery must never execute a generation callback or API');
+});
+
 test('round-trips multiline prompts, ordinary backslashes, and positions', () => {
   const { parseNai5PromptText, formatNai5PromptText } = loadPromptFormatFunctions();
   const expected = {

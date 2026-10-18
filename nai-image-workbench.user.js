@@ -1510,6 +1510,21 @@
     };
   }
 
+  function readGenerationMemoValues(fiber) {
+    const values = [];
+    let hook = fiber?.memoizedState;
+    for (let index = 0; hook && index < 260; index += 1, hook = hook.next) {
+      const value = hook.memoizedState;
+      values.push(Array.isArray(value) ? value[0] : value);
+    }
+    // React Compiler stores useMemo/useCallback results in cache slots instead
+    // of individual hooks. Inspect slots only; never invoke cached functions.
+    for (const slots of fiber?.updateQueue?.memoCache?.data || []) {
+      if (Array.isArray(slots)) values.push(...slots);
+    }
+    return values;
+  }
+
   function prepareCurrentGenerationCallback(button, busyAccess, wantsGridOverride = null) {
     const fiber = findGenerationComponentFiber(button);
     let normalCallback = null;
@@ -1519,8 +1534,16 @@
     let hook = fiber?.memoizedState;
     for (let index = 0; hook && index < 260; index += 1, hook = hook.next) {
       const value = hook.memoizedState;
-      if (Array.isArray(value) && typeof value[0] === 'function') {
-        const candidate = value[0];
+      if (Array.isArray(value) && value[1] === busyAccess.store && value[2]) {
+        try {
+          atomSnapshot.set(value[2], busyAccess.store.get(value[2]));
+        } catch {
+          // A derived atom can become temporarily unreadable during a render.
+        }
+      }
+    }
+    for (const candidate of readGenerationMemoValues(fiber)) {
+      if (typeof candidate === 'function') {
         const source = String(candidate);
         const isCurrentNormalCallback = source.includes('{force:')
           && source.includes('.start')
@@ -1533,14 +1556,7 @@
         if (isCurrentNormalCallback || isLegacyNormalCallback) normalCallback = candidate;
         else if (isCurrentGridCallback || isLegacyGridCallback) gridCallback = candidate;
       }
-      if (Array.isArray(value) && value[1] === busyAccess.store && value[2]) {
-        try {
-          atomSnapshot.set(value[2], busyAccess.store.get(value[2]));
-        } catch {
-          // A derived atom can become temporarily unreadable during a render.
-        }
-      }
-      const possibleApi = Array.isArray(value) ? value[0] : value;
+      const possibleApi = candidate;
       if (possibleApi && typeof possibleApi === 'object' && typeof possibleApi.generateNormal === 'function') {
         generationApi = possibleApi;
       }
