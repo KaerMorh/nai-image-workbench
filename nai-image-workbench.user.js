@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.9.1
+// @version      0.9.2
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.9.1';
+  const SCRIPT_VERSION = '0.9.2';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -917,10 +917,14 @@
       if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
       externalAccountRuntime.quote = { amount, at: now() };
       renderExternalAccountUi();
+      updateExternalGenerateButtonIndicator();
+      updateGenerateClickOverlay();
     } catch {
       if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
       externalAccountRuntime.quote = { amount: null, at: now() };
       renderExternalAccountUi();
+      updateExternalGenerateButtonIndicator();
+      updateGenerateClickOverlay();
     }
   }
 
@@ -933,11 +937,10 @@
     }
   }
 
-  function captureExternalPriceFromFetch(input, init) {
+  function cacheExternalQuoteBodyFromFetch(input, init) {
     const handleBody = (text) => {
       if (typeof text !== 'string' || text.length > 131_072 || !text.trimStart().startsWith('{')) return;
       externalAccountRuntime.lastQuoteBody = text;
-      if (getActiveExternalAccount()) void queryExternalQuote(text);
     };
     if (typeof init?.body === 'string') {
       handleBody(init.body);
@@ -945,6 +948,41 @@
     }
     if (input instanceof Request) {
       void input.clone().text().then(handleBody).catch(() => {});
+    }
+  }
+
+  async function fetchPriceWithExternalAccount(input, init) {
+    cacheExternalQuoteBodyFromFetch(input, init);
+    const active = getActiveExternalAccount();
+    if (!active) return nativeFetch(input, init);
+    const activeId = active.id;
+    const seq = ++externalAccountRuntime.quoteSeq;
+    const [nextInput, nextInit] = applyExternalAuthToFetchArgs(input, init, active.token);
+    try {
+      const response = await nativeFetch(nextInput, nextInit);
+      if (response.ok) {
+        void response.clone().json().then((data) => {
+          if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
+          externalAccountRuntime.quote = { amount: readExternalPrice(data), at: now() };
+          renderExternalAccountUi();
+          updateExternalGenerateButtonIndicator();
+          updateGenerateClickOverlay();
+        }).catch(() => {});
+      } else if (externalAccountRuntime.activeId === activeId && externalAccountRuntime.quoteSeq === seq) {
+        externalAccountRuntime.quote = { amount: null, at: now() };
+        renderExternalAccountUi();
+        updateExternalGenerateButtonIndicator();
+        updateGenerateClickOverlay();
+      }
+      return response;
+    } catch (error) {
+      if (externalAccountRuntime.activeId === activeId && externalAccountRuntime.quoteSeq === seq) {
+        externalAccountRuntime.quote = { amount: null, at: now() };
+        renderExternalAccountUi();
+        updateExternalGenerateButtonIndicator();
+        updateGenerateClickOverlay();
+      }
+      throw error;
     }
   }
 
@@ -1047,6 +1085,17 @@
     (document.head || document.documentElement).append(style);
   }
 
+  function externalButtonBadgeText(active, buttonText = '') {
+    const quoteAmount = externalAccountRuntime.quote?.amount;
+    if (quoteAmount !== null && quoteAmount !== undefined) {
+      const buttonPrice = extractCapturedPrice(buttonText);
+      if (buttonPrice !== quoteAmount) {
+        return `外部API · ${active.label} · 实耗 ${quoteAmount} Anlas`;
+      }
+    }
+    return `外部API · ${active.label}`;
+  }
+
   function updateExternalGenerateButtonIndicator() {
     const buttons = Array.from(document.querySelectorAll('button.image-gen-generate-button'));
     const active = imageRouteActive ? getActiveExternalAccount() : null;
@@ -1058,8 +1107,8 @@
       return;
     }
     ensureExternalApiButtonStyle();
-    const badge = `外部API · ${active.label}`;
     for (const button of buttons) {
+      const badge = externalButtonBadgeText(active, button.innerText);
       if (button.getAttribute(EXTERNAL_API_BUTTON_ATTR) !== 'true') {
         button.setAttribute(EXTERNAL_API_BUTTON_ATTR, 'true');
       }
@@ -1089,7 +1138,7 @@
       const meta = this.__naiExternalMeta;
       if (meta && (imageRouteActive || isImageRoute()) && String(name || '').toLowerCase() === 'authorization') {
         const route = classifyExternalRoute(meta.url, meta.method);
-        const active = route?.kind === 'image' ? getActiveExternalAccount() : null;
+        const active = (route?.kind === 'image' || route?.kind === 'price') ? getActiveExternalAccount() : null;
         if (active) {
           meta.authSet = true;
           meta.activeId = active.id;
@@ -1104,10 +1153,39 @@
       const meta = this.__naiExternalMeta;
       if (meta && (imageRouteActive || isImageRoute())) {
         const route = classifyExternalRoute(meta.url, meta.method);
-        if (route?.kind === 'price' && typeof body === 'string') {
-          if (body.length <= 131_072 && body.trimStart().startsWith('{')) {
+        if (route?.kind === 'price') {
+          if (typeof body === 'string' && body.length <= 131_072 && body.trimStart().startsWith('{')) {
             externalAccountRuntime.lastQuoteBody = body;
-            if (getActiveExternalAccount()) void queryExternalQuote(body);
+          }
+          const active = getActiveExternalAccount();
+          if (active) {
+            if (!meta.authSet) {
+              try {
+                nativeSetRequestHeader.call(this, 'Authorization', `Bearer ${active.token}`);
+              } catch {
+                // Ignore if XHR state rejects header injection.
+              }
+            }
+            const activeId = meta.activeId || active.id;
+            const seq = ++externalAccountRuntime.quoteSeq;
+            this.addEventListener('loadend', () => {
+              if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
+              let amount = null;
+              if (this.status >= 200 && this.status < 300) {
+                try {
+                  const data = this.responseType === 'json'
+                    ? this.response
+                    : safeJsonParse(this.responseText);
+                  amount = readExternalPrice(data);
+                } catch {
+                  amount = null;
+                }
+              }
+              externalAccountRuntime.quote = { amount, at: now() };
+              renderExternalAccountUi();
+              updateExternalGenerateButtonIndicator();
+              updateGenerateClickOverlay();
+            }, { once: true });
           }
         } else if (route?.kind === 'image') {
           const active = getActiveExternalAccount();
@@ -3327,8 +3405,7 @@
     const method = init?.method || (input instanceof Request ? input.method : 'GET');
     const externalRoute = (imageRouteActive || isImageRoute()) ? classifyExternalRoute(url, method) : null;
     if (externalRoute?.kind === 'price') {
-      captureExternalPriceFromFetch(input, init);
-      return nativeFetch(input, init);
+      return fetchPriceWithExternalAccount(input, init);
     }
     if (externalRoute?.kind === 'image' && !isGenerationUrl(url)) {
       return fetchWithExternalAccount(input, init, externalRoute.route);
@@ -3441,7 +3518,7 @@
     overlay.dataset.capturing = enqueueCaptureInFlight ? 'true' : 'false';
     const activeExternal = getActiveExternalAccount();
     overlay.dataset.externalApi = activeExternal ? 'true' : 'false';
-    if (activeExternal) overlay.dataset.externalBadge = `外部API · ${activeExternal.label}`;
+    if (activeExternal) overlay.dataset.externalBadge = externalButtonBadgeText(activeExternal, button.innerText);
     else delete overlay.dataset.externalBadge;
     const label = overlay.querySelector('.generate-hitbox-label');
     const cost = overlay.querySelector('.generate-hitbox-cost');
