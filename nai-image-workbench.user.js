@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.9.2
+// @version      0.9.3
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.9.2';
+  const SCRIPT_VERSION = '0.9.3';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -61,6 +61,9 @@
   const EXTERNAL_PRICE_ROUTE = '/ai/generate-image/request-price';
   const EXTERNAL_ACCOUNTS_STORAGE_KEY = 'nai-image-workbench-external-accounts-v1';
   const EXTERNAL_ACTIVE_SESSION_KEY = 'nai-image-workbench-active-external-account-v1';
+  const EXTERNAL_STATS_STORAGE_KEY = 'nai-image-workbench-external-stats-v1';
+  const MAX_EXTERNAL_RECENT_LOGS = 50;
+  const MAX_EXTERNAL_STAT_DAYS = 90;
   const EXTERNAL_API_STYLE_ID = 'nai-image-workbench-external-api-style';
   const EXTERNAL_API_BUTTON_ATTR = 'data-nai-image-workbench-external-api';
   const EXTERNAL_API_BADGE_ATTR = 'data-nai-image-workbench-external-badge';
@@ -124,9 +127,12 @@
     lastQuoteBody: null,
     result: null,
     editingId: null,
+    dashboardScope: 'current',
+    showAllLogs: false,
     refreshSeq: 0,
     quoteSeq: 0,
   };
+  let externalStatsStore = null;
 
   class QueueTimeoutError extends Error {
     constructor(message = 'Generation timed out after 120 seconds.') {
@@ -707,10 +713,17 @@
   function readExternalPrice(data) {
     const direct = externalPositiveNumber(data);
     if (direct !== null) return direct;
-    for (const key of ['price', 'cost', 'amount', 'anlas', 'requestPrice', 'trainingSteps', 'trainingStepsCost']) {
-      const field = externalPositiveNumber(data?.[key]);
+    if (!data || typeof data !== 'object') return null;
+    if (data.opusFree === true || data.isOpusFree === true || data.free === true) return 0;
+    const keys = [
+      'finalCost', 'finalPrice', 'totalCost', 'discountedPrice', 'effectiveCost',
+      'price', 'cost', 'amount', 'anlas', 'requestPrice', 'trainingStepsCost', 'trainingSteps',
+    ];
+    for (const key of keys) {
+      const field = externalPositiveNumber(data[key]);
       if (field !== null) return field;
     }
+    if (data.data && typeof data.data === 'object') return readExternalPrice(data.data);
     return null;
   }
 
@@ -734,6 +747,274 @@
         })[result.status] ?? `HTTP ${result.status}`;
     const timeText = result.at ? ` · ${new Date(result.at).toLocaleTimeString()}` : '';
     return `${routeName} · ${statusText}${timeText}`;
+  }
+
+  function localDayKey(timestamp = now()) {
+    const d = new Date(timestamp);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function externalRouteCategory(route) {
+    const name = String(route || '').split('/').at(-1) || '';
+    if (name.startsWith('generate-image')) return 'generate';
+    if (name === 'upscale') return 'upscale';
+    if (name === 'augment-image') return 'augment';
+    if (name === 'encode-vibe') return 'vibe';
+    return 'generate';
+  }
+
+  function externalRouteLabel(route) {
+    const category = externalRouteCategory(route);
+    return ({ generate: '生图', upscale: '放大', augment: '图像工具', vibe: 'Vibe' })[category] || '图像';
+  }
+
+  function defaultExternalStats() {
+    return { version: 1, accounts: {}, recentLogs: [] };
+  }
+
+  function normalizeExternalStats(raw) {
+    const base = defaultExternalStats();
+    if (!raw || typeof raw !== 'object') return base;
+    if (raw.accounts && typeof raw.accounts === 'object') {
+      for (const [id, entry] of Object.entries(raw.accounts)) {
+        if (!id || !entry || typeof entry !== 'object') continue;
+        const byDay = {};
+        if (entry.byDay && typeof entry.byDay === 'object') {
+          const dayKeys = Object.keys(entry.byDay).sort().slice(-MAX_EXTERNAL_STAT_DAYS);
+          for (const key of dayKeys) {
+            const d = entry.byDay[key];
+            if (!d || typeof d !== 'object') continue;
+            byDay[key] = {
+              requests: Math.max(0, Number(d.requests) || 0),
+              failed: Math.max(0, Number(d.failed) || 0),
+              anlas: Math.max(0, Number(d.anlas) || 0),
+              free: Math.max(0, Number(d.free) || 0),
+            };
+          }
+        }
+        base.accounts[id] = {
+          label: normalizeWhitespace(entry.label || '') || id,
+          totalRequests: Math.max(0, Number(entry.totalRequests) || 0),
+          failedRequests: Math.max(0, Number(entry.failedRequests) || 0),
+          totalAnlas: Math.max(0, Number(entry.totalAnlas) || 0),
+          freeRequests: Math.max(0, Number(entry.freeRequests) || 0),
+          byRoute: {
+            generate: Math.max(0, Number(entry.byRoute?.generate) || 0),
+            upscale: Math.max(0, Number(entry.byRoute?.upscale) || 0),
+            augment: Math.max(0, Number(entry.byRoute?.augment) || 0),
+            vibe: Math.max(0, Number(entry.byRoute?.vibe) || 0),
+          },
+          byDay,
+          lastUsedAt: Number(entry.lastUsedAt) || null,
+        };
+      }
+    }
+    if (Array.isArray(raw.recentLogs)) {
+      base.recentLogs = raw.recentLogs
+        .filter((log) => log && typeof log === 'object' && log.id)
+        .slice(0, MAX_EXTERNAL_RECENT_LOGS)
+        .map((log) => ({
+          id: String(log.id),
+          at: Number(log.at) || now(),
+          accountId: String(log.accountId || ''),
+          label: normalizeWhitespace(log.label || '') || '外部 API',
+          route: String(log.route || ''),
+          status: log.status,
+          ok: Boolean(log.ok),
+          anlas: log.anlas === null || log.anlas === undefined ? null : Math.max(0, Number(log.anlas) || 0),
+          estimated: Boolean(log.estimated),
+        }));
+    }
+    return base;
+  }
+
+  function loadExternalStats() {
+    try {
+      const raw = localStorage.getItem(EXTERNAL_STATS_STORAGE_KEY);
+      externalStatsStore = raw ? normalizeExternalStats(JSON.parse(raw)) : defaultExternalStats();
+    } catch {
+      externalStatsStore = defaultExternalStats();
+    }
+    return externalStatsStore;
+  }
+
+  function persistExternalStats(stats) {
+    externalStatsStore = normalizeExternalStats(stats);
+    try {
+      localStorage.setItem(EXTERNAL_STATS_STORAGE_KEY, JSON.stringify(externalStatsStore));
+    } catch {
+      // Ignore storage quota errors.
+    }
+    return externalStatsStore;
+  }
+
+  function ensureExternalAccountStatBucket(stats, accountId, label) {
+    if (!stats.accounts[accountId]) {
+      stats.accounts[accountId] = {
+        label: label || accountId,
+        totalRequests: 0,
+        failedRequests: 0,
+        totalAnlas: 0,
+        freeRequests: 0,
+        byRoute: { generate: 0, upscale: 0, augment: 0, vibe: 0 },
+        byDay: {},
+        lastUsedAt: null,
+      };
+    } else if (label) {
+      stats.accounts[accountId].label = label;
+    }
+    return stats.accounts[accountId];
+  }
+
+  function recordExternalUsageStat({ accountId, label, route, status, timestamp = now() }) {
+    const stats = loadExternalStats();
+    const bucket = ensureExternalAccountStatBucket(stats, accountId, label);
+    const dayKey = localDayKey(timestamp);
+    if (!bucket.byDay[dayKey]) {
+      bucket.byDay[dayKey] = { requests: 0, failed: 0, anlas: 0, free: 0 };
+    }
+    const ok = typeof status === 'number' && status >= 200 && status < 300;
+    const category = externalRouteCategory(route);
+    if (ok) {
+      bucket.totalRequests += 1;
+      bucket.byRoute[category] = (bucket.byRoute[category] || 0) + 1;
+      bucket.byDay[dayKey].requests += 1;
+    } else {
+      bucket.failedRequests += 1;
+      bucket.byDay[dayKey].failed += 1;
+    }
+    bucket.lastUsedAt = timestamp;
+    const logId = crypto.randomUUID();
+    stats.recentLogs.unshift({
+      id: logId,
+      at: timestamp,
+      accountId,
+      label: label || bucket.label,
+      route,
+      status,
+      ok,
+      anlas: ok ? null : 0,
+      estimated: false,
+    });
+    if (stats.recentLogs.length > MAX_EXTERNAL_RECENT_LOGS) {
+      stats.recentLogs.length = MAX_EXTERNAL_RECENT_LOGS;
+    }
+    persistExternalStats(stats);
+    return { logId, dayKey, ok };
+  }
+
+  function settleExternalUsageAnlas({ accountId, logId, dayKey, anlasDelta, estimated = false }) {
+    if (anlasDelta === null || anlasDelta === undefined) return;
+    const delta = Math.max(0, Number(anlasDelta) || 0);
+    const stats = loadExternalStats();
+    const bucket = stats.accounts[accountId];
+    if (bucket) {
+      bucket.totalAnlas += delta;
+      if (delta === 0) bucket.freeRequests += 1;
+      if (bucket.byDay[dayKey]) {
+        bucket.byDay[dayKey].anlas += delta;
+        if (delta === 0) bucket.byDay[dayKey].free += 1;
+      }
+    }
+    const log = stats.recentLogs.find((item) => item.id === logId);
+    if (log) {
+      log.anlas = delta;
+      log.estimated = Boolean(estimated);
+    }
+    persistExternalStats(stats);
+  }
+
+  function aggregateExternalDashboardStats(stats, scope, activeId) {
+    const today = localDayKey();
+    const dayKeys = [];
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - offset);
+      dayKeys.push(localDayKey(d.getTime()));
+    }
+    const targetIds = scope === 'current' && activeId
+      ? (stats.accounts[activeId] ? [activeId] : [])
+      : Object.keys(stats.accounts);
+
+    const summary = {
+      todayRequests: 0,
+      todayFailed: 0,
+      todayAnlas: 0,
+      todayFree: 0,
+      totalRequests: 0,
+      failedRequests: 0,
+      totalAnlas: 0,
+      freeRequests: 0,
+      byRoute: { generate: 0, upscale: 0, augment: 0, vibe: 0 },
+      days: dayKeys.map((key) => ({ key, label: key.slice(5), requests: 0, anlas: 0 })),
+      perAccount: [],
+      logs: [],
+    };
+    const dayMap = new Map(summary.days.map((item) => [item.key, item]));
+
+    for (const id of targetIds) {
+      const bucket = stats.accounts[id];
+      if (!bucket) continue;
+      const saved = savedExternalAccounts.find((item) => item.id === id);
+      const displayLabel = saved?.label || bucket.label || id;
+      summary.totalRequests += bucket.totalRequests;
+      summary.failedRequests += bucket.failedRequests;
+      summary.totalAnlas += bucket.totalAnlas;
+      summary.freeRequests += bucket.freeRequests;
+      summary.byRoute.generate += bucket.byRoute.generate || 0;
+      summary.byRoute.upscale += bucket.byRoute.upscale || 0;
+      summary.byRoute.augment += bucket.byRoute.augment || 0;
+      summary.byRoute.vibe += bucket.byRoute.vibe || 0;
+
+      const todayBucket = bucket.byDay[today];
+      if (todayBucket) {
+        summary.todayRequests += todayBucket.requests;
+        summary.todayFailed += todayBucket.failed;
+        summary.todayAnlas += todayBucket.anlas;
+        summary.todayFree += todayBucket.free;
+      }
+      for (const [key, dayEntry] of Object.entries(bucket.byDay)) {
+        const targetDay = dayMap.get(key);
+        if (!targetDay) continue;
+        targetDay.requests += dayEntry.requests;
+        targetDay.anlas += dayEntry.anlas;
+      }
+      summary.perAccount.push({
+        id,
+        label: displayLabel,
+        totalRequests: bucket.totalRequests,
+        totalAnlas: bucket.totalAnlas,
+        todayRequests: todayBucket?.requests || 0,
+        todayAnlas: todayBucket?.anlas || 0,
+      });
+    }
+    summary.perAccount.sort((a, b) => b.totalRequests - a.totalRequests || b.totalAnlas - a.totalAnlas);
+    summary.logs = scope === 'current' && activeId
+      ? stats.recentLogs.filter((log) => log.accountId === activeId)
+      : stats.recentLogs.slice();
+    return summary;
+  }
+
+  function clearExternalUsageStats() {
+    const scope = externalAccountRuntime.dashboardScope;
+    const active = getActiveExternalAccount();
+    if (scope === 'current' && active) {
+      if (!window.confirm(`确定清空外部 API「${active.label}」的统计记录吗？`)) return;
+      const stats = loadExternalStats();
+      delete stats.accounts[active.id];
+      stats.recentLogs = stats.recentLogs.filter((log) => log.accountId !== active.id);
+      persistExternalStats(stats);
+      notify(`已清空「${active.label}」的用量统计。`, 'success');
+    } else {
+      if (!window.confirm('确定清空全部外部 API 的用量统计和消耗明细吗？')) return;
+      persistExternalStats(defaultExternalStats());
+      notify('已清空全部外部 API 用量统计。', 'success');
+    }
+    renderExternalAccountUi();
   }
 
   function normalizeSavedExternalAccounts(list) {
@@ -930,10 +1211,43 @@
 
   function recordExternalImageResult(route, status, accountId) {
     if (!accountId || externalAccountRuntime.activeId !== accountId) return;
-    externalAccountRuntime.result = { route, status, at: now() };
+    const active = getActiveExternalAccount();
+    const beforeTotal = externalAccountRuntime.account?.total ?? null;
+    const fallbackQuote = externalRouteCategory(route) === 'generate'
+      ? (externalAccountRuntime.quote?.amount ?? null)
+      : null;
+    const timestamp = now();
+    externalAccountRuntime.result = { route, status, at: timestamp };
+    const statRecord = recordExternalUsageStat({
+      accountId,
+      label: active?.label || '外部 API',
+      route,
+      status,
+      timestamp,
+    });
     renderExternalAccountUi();
-    if (typeof status === 'number' && status >= 200 && status < 300) {
-      void refreshExternalAccountSummary({ silent: true });
+    if (statRecord.ok) {
+      void refreshExternalAccountSummary({ silent: true }).then((summary) => {
+        const afterTotal = summary?.total ?? null;
+        if (beforeTotal !== null && afterTotal !== null && beforeTotal >= afterTotal) {
+          settleExternalUsageAnlas({
+            accountId,
+            logId: statRecord.logId,
+            dayKey: statRecord.dayKey,
+            anlasDelta: beforeTotal - afterTotal,
+            estimated: false,
+          });
+        } else if (fallbackQuote !== null) {
+          settleExternalUsageAnlas({
+            accountId,
+            logId: statRecord.logId,
+            dayKey: statRecord.dayKey,
+            anlasDelta: fallbackQuote,
+            estimated: true,
+          });
+        }
+        renderExternalAccountUi();
+      });
     }
   }
 
@@ -4728,6 +5042,124 @@
         }
       }
     }
+
+    renderExternalDashboardUi();
+  }
+
+  function renderExternalDashboardUi() {
+    if (!shadow) return;
+    const stats = externalStatsStore || loadExternalStats();
+    const active = getActiveExternalAccount();
+    const effectiveScope = externalAccountRuntime.dashboardScope === 'current' && active ? 'current' : 'all';
+
+    shadow.querySelectorAll('.ext-dash-scope').forEach((btn) => {
+      const scope = btn.dataset.scope;
+      btn.classList.toggle('active', scope === effectiveScope);
+      if (scope === 'current') btn.disabled = !active;
+    });
+
+    const data = aggregateExternalDashboardStats(stats, effectiveScope, active?.id || null);
+    shadow.querySelector('.ext-kpi-today-req').textContent = `${data.todayRequests} 次`;
+    shadow.querySelector('.ext-kpi-today-sub').textContent = `0 耗 ${data.todayFree} · 失败 ${data.todayFailed}`;
+    shadow.querySelector('.ext-kpi-today-anlas').textContent = `${data.todayAnlas} Anlas`;
+    const todayAvg = data.todayRequests > 0 ? (data.todayAnlas / data.todayRequests).toFixed(1) : '0';
+    shadow.querySelector('.ext-kpi-today-avg').textContent = data.todayRequests > 0
+      ? `均耗 ${todayAvg} Anlas/次`
+      : '按余额差值实测';
+
+    const otherRoutes = (data.byRoute.augment || 0) + (data.byRoute.vibe || 0);
+    shadow.querySelector('.ext-kpi-total-req').textContent = `${data.totalRequests} 次`;
+    shadow.querySelector('.ext-kpi-total-sub').textContent = `生图 ${data.byRoute.generate} · 放大 ${data.byRoute.upscale} · 其他 ${otherRoutes}`;
+    shadow.querySelector('.ext-kpi-total-anlas').textContent = `${data.totalAnlas} Anlas`;
+    shadow.querySelector('.ext-kpi-total-free').textContent = `0 耗 ${data.freeRequests} 次 · 失败 ${data.failedRequests} 次`;
+
+    const chart = shadow.querySelector('.ext-chart');
+    chart.replaceChildren();
+    const maxReq = Math.max(1, ...data.days.map((item) => item.requests));
+    for (const day of data.days) {
+      const col = document.createElement('div');
+      col.className = 'ext-chart-col';
+      col.title = `${day.key}：${day.requests} 次 · ${day.anlas} Anlas`;
+      const val = document.createElement('span');
+      val.className = 'ext-chart-val';
+      val.textContent = day.requests > 0 ? String(day.requests) : '';
+      const bar = document.createElement('div');
+      bar.className = `ext-chart-bar${day.requests > 0 ? '' : ' empty'}`;
+      const heightPx = day.requests > 0 ? Math.max(5, Math.round((day.requests / maxReq) * 34)) : 2;
+      bar.style.height = `${heightPx}px`;
+      const label = document.createElement('span');
+      label.className = 'ext-chart-day';
+      label.textContent = day.label;
+      col.append(val, bar, label);
+      chart.append(col);
+    }
+
+    const accountsBox = shadow.querySelector('.ext-dash-accounts');
+    accountsBox.replaceChildren();
+    const showPerAccount = effectiveScope === 'all' && data.perAccount.length > 0;
+    accountsBox.hidden = !showPerAccount;
+    if (showPerAccount) {
+      for (const acc of data.perAccount) {
+        const row = document.createElement('div');
+        row.className = 'ext-dash-acc-row';
+        const name = document.createElement('span');
+        name.className = 'ext-dash-acc-name';
+        name.textContent = acc.label;
+        const stat = document.createElement('span');
+        stat.className = 'ext-dash-acc-stat';
+        stat.textContent = `今日 ${acc.todayRequests}次/${acc.todayAnlas} · 累计 ${acc.totalRequests}次/${acc.totalAnlas}`;
+        row.append(name, stat);
+        accountsBox.append(row);
+      }
+    }
+
+    const logsBox = shadow.querySelector('.ext-logs');
+    const toggleBtn = shadow.querySelector('.ext-logs-toggle');
+    logsBox.replaceChildren();
+    const totalLogs = data.logs.length;
+    const limit = externalAccountRuntime.showAllLogs ? totalLogs : 6;
+    toggleBtn.hidden = totalLogs <= 6;
+    if (totalLogs > 6) {
+      toggleBtn.textContent = externalAccountRuntime.showAllLogs ? '收起' : `展开全部 (${totalLogs})`;
+    }
+    if (!totalLogs) {
+      const empty = document.createElement('div');
+      empty.className = 'ext-empty';
+      empty.textContent = '暂无外部 API 调用记录。';
+      logsBox.append(empty);
+    } else {
+      for (const log of data.logs.slice(0, limit)) {
+        const row = document.createElement('div');
+        row.className = 'ext-log-row';
+        const main = document.createElement('span');
+        main.className = 'ext-log-main';
+        const timeEl = document.createElement('span');
+        timeEl.className = 'ext-log-time';
+        timeEl.textContent = new Date(log.at).toLocaleTimeString([], { hour12: false });
+        const desc = effectiveScope === 'all'
+          ? `${externalRouteLabel(log.route)} · ${log.label}`
+          : externalRouteLabel(log.route);
+        main.append(timeEl, document.createTextNode(desc));
+        main.title = `${new Date(log.at).toLocaleString()} · ${log.label} · ${log.route}`;
+
+        const cost = document.createElement('span');
+        cost.className = 'ext-log-cost';
+        if (!log.ok) {
+          cost.classList.add('fail');
+          cost.textContent = log.status === 'network' ? '网络错误' : `HTTP ${log.status}`;
+        } else if (log.anlas === null || log.anlas === undefined) {
+          cost.classList.add('pending');
+          cost.textContent = '统计中…';
+        } else if (log.anlas === 0) {
+          cost.classList.add('free');
+          cost.textContent = log.estimated ? '~0 免费' : '0 免费';
+        } else {
+          cost.textContent = `${log.estimated ? '~' : '-'}${log.anlas} Anlas`;
+        }
+        row.append(main, cost);
+        logsBox.append(row);
+      }
+    }
   }
 
   function renderPromptImportUi() {
@@ -4837,6 +5269,40 @@
         .ext-form-actions button { flex: 1 1 auto; }
         .ext-form-cancel[hidden] { display: none; }
         .ext-help { color: #969dc7; font-size: 11px; }
+        .ext-dash { display: flex; flex-direction: column; gap: 8px; padding: 9px; background: #191d3a; border: 1px solid #363d66; border-radius: 8px; }
+        .ext-dash-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+        .ext-dash-title { color: #f5f3c2; font-size: 12px; font-weight: 700; }
+        .ext-dash-controls { display: flex; align-items: center; gap: 4px; }
+        .ext-dash-controls button { padding: 3px 6px; font-size: 10px; }
+        .ext-dash-controls button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
+        .ext-kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+        .ext-kpi { padding: 7px 8px; background: #121633; border: 1px solid #2f365e; border-radius: 6px; }
+        .ext-kpi-label { color: #969dc7; font-size: 10px; }
+        .ext-kpi-value { margin-top: 2px; color: #fff; font-size: 15px; font-weight: 700; line-height: 1.2; }
+        .ext-kpi-value.accent { color: #f5f3c2; }
+        .ext-kpi-sub { margin-top: 2px; color: #8c94bf; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ext-chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 4px; height: 66px; padding: 6px 4px 2px; background: #121633; border: 1px solid #2f365e; border-radius: 6px; }
+        .ext-chart-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 2px; height: 100%; min-width: 0; }
+        .ext-chart-val { color: #aeb5da; font-size: 9px; line-height: 1; }
+        .ext-chart-bar { width: 100%; max-width: 20px; min-height: 2px; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, #f5f3c2, #7077c2); transition: height .15s ease; }
+        .ext-chart-bar.empty { background: #2c3359; }
+        .ext-chart-day { color: #858db9; font-size: 9px; line-height: 1; }
+        .ext-dash-accounts { display: flex; flex-direction: column; gap: 4px; }
+        .ext-dash-accounts[hidden] { display: none; }
+        .ext-dash-acc-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 7px; background: #121633; border-radius: 5px; font-size: 11px; }
+        .ext-dash-acc-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dce0ff; font-weight: 600; }
+        .ext-dash-acc-stat { flex: 0 0 auto; color: #aeb5da; font-size: 10px; }
+        .ext-logs-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: #aeb5da; font-size: 11px; }
+        .ext-logs-toggle { padding: 2px 6px; font-size: 10px; }
+        .ext-logs-toggle[hidden] { display: none; }
+        .ext-logs { display: flex; flex-direction: column; gap: 4px; max-height: 170px; overflow-y: auto; }
+        .ext-log-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 7px; background: #121633; border-radius: 5px; font-size: 11px; }
+        .ext-log-main { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfd5ff; }
+        .ext-log-time { color: #858db9; font-family: ui-monospace, Consolas, monospace; font-size: 10px; margin-right: 5px; }
+        .ext-log-cost { flex: 0 0 auto; font-weight: 700; font-size: 11px; color: #f5f3c2; }
+        .ext-log-cost.free { color: #74d99f; }
+        .ext-log-cost.fail { color: #ff8c9b; }
+        .ext-log-cost.pending { color: #858db9; font-weight: 500; }
         .body { min-height: 140px; overflow: auto; padding: 8px 10px 10px; }
         .view[hidden] { display: none; }
         .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 8px; }
@@ -5000,6 +5466,29 @@
                   <button class="ext-disable danger" type="button">恢复网页账号</button>
                 </div>
               </div>
+              <div class="ext-dash" aria-label="外部 API 用量统计">
+                <div class="ext-dash-head">
+                  <span class="ext-dash-title">用量统计 Dashboard</span>
+                  <div class="ext-dash-controls">
+                    <button class="ext-dash-scope" type="button" data-scope="current">当前账号</button>
+                    <button class="ext-dash-scope" type="button" data-scope="all">全部</button>
+                    <button class="ext-dash-clear danger" type="button">清空</button>
+                  </div>
+                </div>
+                <div class="ext-kpi-grid">
+                  <div class="ext-kpi"><div class="ext-kpi-label">今日次数</div><div class="ext-kpi-value ext-kpi-today-req">0 次</div><div class="ext-kpi-sub ext-kpi-today-sub">0 耗 0 · 失败 0</div></div>
+                  <div class="ext-kpi"><div class="ext-kpi-label">今日消耗</div><div class="ext-kpi-value accent ext-kpi-today-anlas">0 Anlas</div><div class="ext-kpi-sub ext-kpi-today-avg">按余额差值实测</div></div>
+                  <div class="ext-kpi"><div class="ext-kpi-label">累计次数</div><div class="ext-kpi-value ext-kpi-total-req">0 次</div><div class="ext-kpi-sub ext-kpi-total-sub">生图 0 · 放大 0 · 其他 0</div></div>
+                  <div class="ext-kpi"><div class="ext-kpi-label">累计消耗</div><div class="ext-kpi-value accent ext-kpi-total-anlas">0 Anlas</div><div class="ext-kpi-sub ext-kpi-total-free">0 耗 0 次 · 失败 0 次</div></div>
+                </div>
+                <div class="ext-chart" aria-label="近 7 天调用趋势"></div>
+                <div class="ext-dash-accounts" hidden></div>
+                <div class="ext-logs-head">
+                  <span class="ext-logs-title">最近消耗明细</span>
+                  <button class="ext-logs-toggle" type="button" hidden>展开全部</button>
+                </div>
+                <div class="ext-logs"></div>
+              </div>
               <div class="ext-section-title">已保存的外部 API（持久化 · 当前标签页独立生效）</div>
               <div class="ext-account-list"></div>
               <div class="ext-form" role="region" aria-label="添加外部 API">
@@ -5063,6 +5552,17 @@
     shadow.querySelector('.external-account-bar').addEventListener('click', () => void openExternalAccountPanel());
     shadow.querySelector('.ext-refresh').addEventListener('click', () => void refreshExternalAccountSummary({ alsoQuote: true }));
     shadow.querySelector('.ext-disable').addEventListener('click', () => disableExternalAccount());
+    shadow.querySelectorAll('.ext-dash-scope').forEach((button) => {
+      button.addEventListener('click', () => {
+        externalAccountRuntime.dashboardScope = button.dataset.scope === 'all' ? 'all' : 'current';
+        renderExternalDashboardUi();
+      });
+    });
+    shadow.querySelector('.ext-dash-clear').addEventListener('click', clearExternalUsageStats);
+    shadow.querySelector('.ext-logs-toggle').addEventListener('click', () => {
+      externalAccountRuntime.showAllLogs = !externalAccountRuntime.showAllLogs;
+      renderExternalDashboardUi();
+    });
     shadow.querySelector('.ext-token-visibility').addEventListener('click', () => {
       const input = shadow.querySelector('.ext-token-input');
       const btn = shadow.querySelector('.ext-token-visibility');
@@ -5535,6 +6035,11 @@
     }
 
     window.addEventListener('storage', (event) => {
+      if (event.key === EXTERNAL_STATS_STORAGE_KEY) {
+        loadExternalStats();
+        renderExternalDashboardUi();
+        return;
+      }
       if (event.key !== EXTERNAL_ACCOUNTS_STORAGE_KEY) return;
       loadSavedExternalAccounts();
       if (externalAccountRuntime.activeId && !getActiveExternalAccount()) {

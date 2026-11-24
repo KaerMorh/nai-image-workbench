@@ -571,3 +571,13 @@ test('supports persistent multi-key external API switching per tab with Generate
   assert.match(helpers.formatExternalRecoveryTimer(900), /15 分钟/);
   assert.match(helpers.formatExternalRequestResult({ route: '/ai/generate-image', status: 402, at: 0 }), /额度不足/);
 });
+
+test('tracks external API usage counts and Anlas consumption in a persistent dashboard', () => {
+  assert.match(source, /EXTERNAL_STATS_STORAGE_KEY = 'nai-image-workbench-external-stats-v1'/);
+  assert.match(source, /用量统计 Dashboard/);
+  assert.match(source, /class="ext-chart"/);
+  assert.match(source, /function recordExternalUsageStat/);
+  assert.match(source, /function settleExternalUsageAnlas/);
+  assert.match(source, /function aggregateExternalDashboardStats/);
+  assert.match(source, /function renderExternalDashboardUi/);
+});
