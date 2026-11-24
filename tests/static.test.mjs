@@ -336,6 +336,50 @@ test('finds generation callbacks and API in React Compiler caches without invoki
   assert.equal(invocations, 0, 'discovery must never execute a generation callback or API');
 });
 
+test('chunk downloads preserve groups, order and exact text; incomplete groups cannot download', async () => {
+  const start = source.indexOf('function readPromptChunksBackup');
+  const end = source.indexOf('function installPromptChunkBackupButtons', start);
+  const files = [];
+  let blob;
+  const save = new Function('document', 'URL', 'nativeSetTimeout', 'notify',
+    source.slice(start, end) + '\nreturn savePromptChunksBackup;')(
+    { createElement: () => ({ click() { files.push({ name: this.download, blob }); } }) },
+    { createObjectURL(value) { blob = value; return 'blob:local'; }, revokeObjectURL() {} },
+    fn => fn(), () => {},
+  );
+  const content = '  first\n\nsecond\u00a0, ';
+  const card = name => ({
+    title: content + '\n\nClick to insert, drag to reorder',
+    querySelector: () => ({ textContent: name }), getAttribute: () => '#123456',
+  });
+  const root = card('same name'), member = card('same name');
+  let count = '1';
+  const header = {
+    querySelectorAll: () => [{}, { textContent: '角色' }, { textContent: count }],
+    parentElement: { contains: el => el === member }, getAttribute: () => '#abcdef',
+  };
+  const panel = { querySelectorAll(selector) {
+    return {
+      '[draggable="true"][title]': [root, member], '[draggable="true"]': [root, header, member],
+      'button[title="Edit Chunk"]': [{}, {}], 'button[title="Edit Category"]': [{ parentElement: header }],
+    }[selector];
+  } };
+  save(panel, 'json');
+  save(panel, 'txt');
+  const json = JSON.parse(await files[0].blob.text());
+  assert.equal(json.totalChunks, 2);
+  assert.deepEqual(json.uncategorized, [{ order: 0, name: 'same name', content, color: '#123456' }]);
+  assert.deepEqual(json.categories, [{ order: 0, name: '角色', color: '#abcdef', chunks: json.uncategorized }]);
+  const txt = await files[1].blob.text();
+  assert.ok(txt.indexOf('未分组') < txt.indexOf('角色'));
+  assert.equal(txt.split(content).length - 1, 2);
+  assert.match(files[0].name, /\.json$/);
+  assert.match(files[1].name, /\.txt$/);
+  count = '2';
+  assert.throws(() => save(panel, 'json'), /展开「角色」/);
+  assert.equal(files.length, 2);
+});
+
 test('round-trips multiline prompts, ordinary backslashes, and positions', () => {
   const { parseNai5PromptText, formatNai5PromptText } = loadPromptFormatFunctions();
   const expected = {
@@ -473,4 +517,57 @@ test('persists batch work but pauses it after a page reload to prevent duplicate
   assert.match(source, /\['capturing', 'running'\]\.includes\(cachedState\.batch\.status\)/);
   assert.match(source, /为避免重复生成/);
   assert.match(source, /paused: true/);
+});
+
+test('supports persistent multi-key external API switching per tab with Generate button indicator', () => {
+  assert.match(source, /EXTERNAL_ACCOUNTS_STORAGE_KEY = 'nai-image-workbench-external-accounts-v1'/);
+  assert.match(source, /EXTERNAL_ACTIVE_SESSION_KEY = 'nai-image-workbench-active-external-account-v1'/);
+  assert.match(source, /class="external-api-shortcut"/);
+  assert.match(source, /class="external-account-bar"/);
+  assert.match(source, /data-special-tab="account">外部 API/);
+  assert.match(source, /installExternalXhrInterceptor\(\)/);
+  assert.match(source, /updateExternalGenerateButtonIndicator\(\)/);
+  assert.match(source, /data-nai-image-workbench-external-api/);
+  assert.match(source, /data-nai-image-workbench-external-badge/);
+  assert.match(source, /localStorage\.setItem\(EXTERNAL_ACCOUNTS_STORAGE_KEY/);
+  assert.match(source, /sessionStorage\.setItem\(EXTERNAL_ACTIVE_SESSION_KEY/);
+
+  const start = source.indexOf('function externalPositiveNumber');
+  const end = source.indexOf('function normalizeSavedExternalAccounts', start);
+  assert.ok(start >= 0 && end > start, 'external API helper functions must remain extractable');
+  const helpers = new Function(`
+    const EXTERNAL_IMAGE_HOST = 'https://image.novelai.net';
+    const EXTERNAL_API_HOST = 'https://api.novelai.net';
+    const EXTERNAL_IMAGE_ROUTES = ['/ai/generate-image', '/ai/generate-image-stream', '/ai/upscale', '/ai/augment-image', '/ai/encode-vibe'];
+    const EXTERNAL_PRICE_ROUTE = '/ai/generate-image/request-price';
+    ${source.slice(start, end)}
+    return { normalizeExternalApiKey, maskExternalApiKey, parseExternalAccountSummary, readExternalPrice, formatExternalRecoveryTimer, formatExternalRequestResult };
+  `)();
+
+  assert.equal(helpers.normalizeExternalApiKey('  Bearer pst-abc123  '), 'pst-abc123');
+  assert.throws(() => helpers.normalizeExternalApiKey('bad key with space'), /格式无效/);
+  assert.equal(helpers.maskExternalApiKey('pst-1234567890abcdef'), 'pst-1234…cdef');
+
+  const summary = helpers.parseExternalAccountSummary({
+    subscription: {
+      tier: 3,
+      active: true,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 10000, purchasedTrainingSteps: 250 },
+      usage: { percent: 85, isNegative: false, timeUntilNextPercent: 900 },
+    },
+  });
+  assert.deepEqual(summary, {
+    tier: 'Opus',
+    active: true,
+    monthly: 10000,
+    purchased: 250,
+    total: 10250,
+    opus: true,
+    percent: 85,
+    nextPercentSeconds: 900,
+  });
+  assert.equal(helpers.readExternalPrice({ requestPrice: 17 }), 17);
+  assert.equal(helpers.readExternalPrice(0), 0);
+  assert.match(helpers.formatExternalRecoveryTimer(900), /15 分钟/);
+  assert.match(helpers.formatExternalRequestResult({ route: '/ai/generate-image', status: 402, at: 0 }), /额度不足/);
 });

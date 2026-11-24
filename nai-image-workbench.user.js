@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.7.0
+// @version      0.9.0
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.7.0';
+  const SCRIPT_VERSION = '0.9.0';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -49,6 +49,21 @@
   const SITE_RETRY_GRACE_MS = 4_000;
   const QUEUE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
   const GENERATION_ENDPOINT_RE = /https:\/\/image\.novelai\.net\/ai\/generate-image(?:-stream)?(?:\?|$)/i;
+  const EXTERNAL_IMAGE_HOST = 'https://image.novelai.net';
+  const EXTERNAL_API_HOST = 'https://api.novelai.net';
+  const EXTERNAL_IMAGE_ROUTES = [
+    '/ai/generate-image',
+    '/ai/generate-image-stream',
+    '/ai/upscale',
+    '/ai/augment-image',
+    '/ai/encode-vibe',
+  ];
+  const EXTERNAL_PRICE_ROUTE = '/ai/generate-image/request-price';
+  const EXTERNAL_ACCOUNTS_STORAGE_KEY = 'nai-image-workbench-external-accounts-v1';
+  const EXTERNAL_ACTIVE_SESSION_KEY = 'nai-image-workbench-active-external-account-v1';
+  const EXTERNAL_API_STYLE_ID = 'nai-image-workbench-external-api-style';
+  const EXTERNAL_API_BUTTON_ATTR = 'data-nai-image-workbench-external-api';
+  const EXTERNAL_API_BADGE_ATTR = 'data-nai-image-workbench-external-badge';
   const LARGE_BINARY_MIN_LENGTH = 16_384;
   const BLOB_REF_KEY = '$naiImageWorkbenchBlobRef';
   const DUPLICATE_GENERATION_MESSAGE = '设置与 Seed 与之前的任务完全重复';
@@ -98,6 +113,20 @@
   const runtimeJobs = new Map();
   const pendingDeleteTimers = new Map();
   const historySavedStates = new WeakMap();
+  let savedExternalAccounts = [];
+  const externalAccountRuntime = {
+    activeId: null,
+    busy: false,
+    account: null,
+    accountError: null,
+    updatedAt: null,
+    quote: null,
+    lastQuoteBody: null,
+    result: null,
+    editingId: null,
+    refreshSeq: 0,
+    quoteSeq: 0,
+  };
 
   class QueueTimeoutError extends Error {
     constructor(message = 'Generation timed out after 120 seconds.') {
@@ -631,6 +660,484 @@
     }
   }
 
+  function externalPositiveNumber(value) {
+    if (typeof value !== 'number' && !(typeof value === 'string' && value.trim())) return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+  }
+
+  function normalizeExternalApiKey(raw) {
+    const cleaned = String(raw ?? '').trim().replace(/^Bearer\s+/i, '').trim();
+    if (!cleaned || cleaned.length > 2048 || !/^[!-~]+$/.test(cleaned)) {
+      throw new Error('API Key 格式无效。请输入 NovelAI API Key（无需 Bearer 前缀）。');
+    }
+    return cleaned;
+  }
+
+  function maskExternalApiKey(token) {
+    const value = String(token || '');
+    if (value.length <= 12) return `${value.slice(0, 3)}…${value.slice(-2)}`;
+    return `${value.slice(0, 8)}…${value.slice(-4)}`;
+  }
+
+  function parseExternalAccountSummary(data) {
+    const sub = data?.subscription
+      ?? data?.information?.subscription
+      ?? data?.data?.subscription
+      ?? data?.data?.information?.subscription
+      ?? data;
+    const tier = externalPositiveNumber(sub?.tier);
+    const steps = sub?.trainingStepsLeft;
+    const monthly = externalPositiveNumber(steps?.fixedTrainingStepsLeft);
+    const purchased = externalPositiveNumber(steps?.purchasedTrainingSteps);
+    const percent = externalPositiveNumber(sub?.usage?.percent);
+    const opus = tier === 3 && sub?.active !== false;
+    return {
+      tier: ['Paper', 'Tablet', 'Scroll', 'Opus'][tier] ?? null,
+      active: sub?.active ?? null,
+      monthly,
+      purchased,
+      total: monthly !== null || purchased !== null ? (monthly ?? 0) + (purchased ?? 0) : externalPositiveNumber(steps),
+      opus,
+      percent: opus ? (sub?.usage?.isNegative ? 0 : percent === null ? null : Math.min(100, percent)) : null,
+      nextPercentSeconds: opus ? externalPositiveNumber(sub?.usage?.timeUntilNextPercent) : null,
+    };
+  }
+
+  function readExternalPrice(data) {
+    const direct = externalPositiveNumber(data);
+    if (direct !== null) return direct;
+    for (const key of ['price', 'cost', 'amount', 'anlas', 'requestPrice', 'trainingSteps', 'trainingStepsCost']) {
+      const field = externalPositiveNumber(data?.[key]);
+      if (field !== null) return field;
+    }
+    return null;
+  }
+
+  function formatExternalRecoveryTimer(seconds) {
+    if (seconds === null || seconds === undefined) return '';
+    const minutes = Math.ceil(seconds / 60);
+    if (minutes < 60) return ` · 约 ${minutes} 分钟恢复下一格`;
+    return ` · 约 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟恢复下一格`;
+  }
+
+  function formatExternalRequestResult(result) {
+    if (!result) return '尚无';
+    const routeName = String(result.route || '').split('/').at(-1) || 'request';
+    const statusText = result.status === 'network'
+      ? '网络错误'
+      : ({
+          401: 'Key 无效或已失效',
+          402: '费用或额度不足',
+          403: 'API 拒绝请求',
+          429: '请求过于频繁',
+        })[result.status] ?? `HTTP ${result.status}`;
+    const timeText = result.at ? ` · ${new Date(result.at).toLocaleTimeString()}` : '';
+    return `${routeName} · ${statusText}${timeText}`;
+  }
+
+  function normalizeSavedExternalAccounts(list) {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const normalized = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const id = String(item.id || '').trim();
+      const label = normalizeWhitespace(item.label || '');
+      let token = '';
+      try {
+        token = normalizeExternalApiKey(item.token);
+      } catch {
+        continue;
+      }
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      normalized.push({
+        id,
+        label: label || maskExternalApiKey(token),
+        token,
+        createdAt: Number(item.createdAt) || now(),
+        updatedAt: Number(item.updatedAt) || now(),
+      });
+    }
+    return normalized;
+  }
+
+  function loadSavedExternalAccounts() {
+    try {
+      const raw = localStorage.getItem(EXTERNAL_ACCOUNTS_STORAGE_KEY);
+      savedExternalAccounts = raw ? normalizeSavedExternalAccounts(JSON.parse(raw)) : [];
+    } catch {
+      savedExternalAccounts = [];
+    }
+    return savedExternalAccounts;
+  }
+
+  function persistSavedExternalAccounts(accounts) {
+    savedExternalAccounts = normalizeSavedExternalAccounts(accounts);
+    try {
+      localStorage.setItem(EXTERNAL_ACCOUNTS_STORAGE_KEY, JSON.stringify(savedExternalAccounts));
+    } catch {
+      // Ignore storage quota errors; in-memory list remains usable for this tab.
+    }
+    return savedExternalAccounts;
+  }
+
+  function persistActiveExternalAccountId(id) {
+    try {
+      if (id) sessionStorage.setItem(EXTERNAL_ACTIVE_SESSION_KEY, String(id));
+      else sessionStorage.removeItem(EXTERNAL_ACTIVE_SESSION_KEY);
+    } catch {
+      // Ignore sessionStorage restrictions.
+    }
+  }
+
+  function getActiveExternalAccount() {
+    if (!externalAccountRuntime.activeId) return null;
+    return savedExternalAccounts.find((item) => item.id === externalAccountRuntime.activeId) || null;
+  }
+
+  function restoreExternalAccountSelection() {
+    loadSavedExternalAccounts();
+    let storedId = null;
+    try {
+      storedId = sessionStorage.getItem(EXTERNAL_ACTIVE_SESSION_KEY) || null;
+    } catch {
+      storedId = null;
+    }
+    if (storedId && savedExternalAccounts.some((item) => item.id === storedId)) {
+      externalAccountRuntime.activeId = storedId;
+    } else {
+      externalAccountRuntime.activeId = null;
+      if (storedId) persistActiveExternalAccountId(null);
+    }
+  }
+
+  function classifyExternalRoute(urlValue, methodValue = 'GET') {
+    if (String(methodValue || 'GET').toUpperCase() !== 'POST') return null;
+    try {
+      const { origin, pathname } = new URL(String(urlValue), location.href);
+      if (origin === EXTERNAL_IMAGE_HOST && EXTERNAL_IMAGE_ROUTES.includes(pathname)) {
+        return { kind: 'image', route: pathname };
+      }
+      if ((origin === EXTERNAL_IMAGE_HOST || origin === EXTERNAL_API_HOST) && pathname === EXTERNAL_PRICE_ROUTE) {
+        return { kind: 'price', route: pathname };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  function applyExternalAuthToFetchArgs(input, init, token) {
+    const authValue = `Bearer ${token}`;
+    if (input instanceof Request) {
+      const headers = new Headers(input.headers);
+      if (init?.headers) {
+        new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+      }
+      headers.set('Authorization', authValue);
+      return [new Request(input, { ...init, headers }), undefined];
+    }
+    const headers = new Headers(init?.headers || undefined);
+    headers.set('Authorization', authValue);
+    return [input, { ...init, headers }];
+  }
+
+  async function fetchExternalAccountSummary(token) {
+    const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(15_000)
+      : undefined;
+    const response = await nativeFetch(`${EXTERNAL_IMAGE_HOST}/user/data`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      redirect: 'error',
+      credentials: 'omit',
+      cache: 'no-store',
+      signal,
+    });
+    if (!response.ok) throw new Error(`账号查询失败（HTTP ${response.status}）`);
+    return parseExternalAccountSummary(await response.json());
+  }
+
+  async function refreshExternalAccountSummary({ silent = false, alsoQuote = false } = {}) {
+    const active = getActiveExternalAccount();
+    if (!active) return null;
+    const seq = ++externalAccountRuntime.refreshSeq;
+    const activeId = active.id;
+    externalAccountRuntime.busy = true;
+    renderExternalAccountUi();
+    try {
+      const summary = await fetchExternalAccountSummary(active.token);
+      if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.refreshSeq !== seq) return null;
+      externalAccountRuntime.account = summary;
+      externalAccountRuntime.accountError = null;
+      externalAccountRuntime.updatedAt = now();
+      if (alsoQuote && externalAccountRuntime.lastQuoteBody) {
+        void queryExternalQuote(externalAccountRuntime.lastQuoteBody);
+      }
+      return summary;
+    } catch (error) {
+      if (externalAccountRuntime.activeId === activeId && externalAccountRuntime.refreshSeq === seq) {
+        externalAccountRuntime.accountError = error?.message || String(error);
+        if (!silent) notify(`外部 API 查询失败：${externalAccountRuntime.accountError}`, 'error');
+      }
+      return null;
+    } finally {
+      if (externalAccountRuntime.refreshSeq === seq) {
+        externalAccountRuntime.busy = false;
+        renderExternalAccountUi();
+      }
+    }
+  }
+
+  async function queryExternalQuote(bodyText) {
+    const active = getActiveExternalAccount();
+    if (!active || typeof bodyText !== 'string' || !bodyText.trimStart().startsWith('{') || bodyText.length > 131_072) {
+      return;
+    }
+    const activeId = active.id;
+    const seq = ++externalAccountRuntime.quoteSeq;
+    try {
+      const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(12_000)
+        : undefined;
+      const response = await nativeFetch(`${EXTERNAL_API_HOST}${EXTERNAL_PRICE_ROUTE}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${active.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: bodyText,
+        credentials: 'omit',
+        redirect: 'error',
+        cache: 'no-store',
+        signal,
+      });
+      const amount = response.ok ? readExternalPrice(await response.json()) : null;
+      if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
+      externalAccountRuntime.quote = { amount, at: now() };
+      renderExternalAccountUi();
+    } catch {
+      if (externalAccountRuntime.activeId !== activeId || externalAccountRuntime.quoteSeq !== seq) return;
+      externalAccountRuntime.quote = { amount: null, at: now() };
+      renderExternalAccountUi();
+    }
+  }
+
+  function recordExternalImageResult(route, status, accountId) {
+    if (!accountId || externalAccountRuntime.activeId !== accountId) return;
+    externalAccountRuntime.result = { route, status, at: now() };
+    renderExternalAccountUi();
+    if (typeof status === 'number' && status >= 200 && status < 300) {
+      void refreshExternalAccountSummary({ silent: true });
+    }
+  }
+
+  function captureExternalPriceFromFetch(input, init) {
+    const handleBody = (text) => {
+      if (typeof text !== 'string' || text.length > 131_072 || !text.trimStart().startsWith('{')) return;
+      externalAccountRuntime.lastQuoteBody = text;
+      if (getActiveExternalAccount()) void queryExternalQuote(text);
+    };
+    if (typeof init?.body === 'string') {
+      handleBody(init.body);
+      return;
+    }
+    if (input instanceof Request) {
+      void input.clone().text().then(handleBody).catch(() => {});
+    }
+  }
+
+  async function fetchWithExternalAccount(input, init, route) {
+    const active = getActiveExternalAccount();
+    if (!active) return nativeFetch(input, init);
+    const activeId = active.id;
+    const [nextInput, nextInit] = applyExternalAuthToFetchArgs(input, init, active.token);
+    try {
+      const response = await nativeFetch(nextInput, nextInit);
+      recordExternalImageResult(route, response.status, activeId);
+      return response;
+    } catch (error) {
+      recordExternalImageResult(route, 'network', activeId);
+      throw error;
+    }
+  }
+
+  async function activateExternalAccount(accountId) {
+    const target = savedExternalAccounts.find((item) => item.id === accountId);
+    if (!target) {
+      notify('未找到对应的外部 API 配置。', 'error');
+      return false;
+    }
+    externalAccountRuntime.busy = true;
+    externalAccountRuntime.accountError = null;
+    renderExternalAccountUi();
+    try {
+      const summary = await fetchExternalAccountSummary(target.token);
+      externalAccountRuntime.activeId = target.id;
+      externalAccountRuntime.account = summary;
+      externalAccountRuntime.accountError = null;
+      externalAccountRuntime.updatedAt = now();
+      externalAccountRuntime.quote = null;
+      externalAccountRuntime.result = null;
+      persistActiveExternalAccountId(target.id);
+      if (externalAccountRuntime.lastQuoteBody) {
+        void queryExternalQuote(externalAccountRuntime.lastQuoteBody);
+      }
+      notify(`当前标签页已切换为外部 API：${target.label}`, 'success');
+      return true;
+    } catch (error) {
+      externalAccountRuntime.accountError = error?.message || String(error);
+      notify(`启用外部 API 失败：${externalAccountRuntime.accountError}`, 'error');
+      return false;
+    } finally {
+      externalAccountRuntime.busy = false;
+      renderExternalAccountUi();
+      updateExternalGenerateButtonIndicator();
+      updateGenerateClickOverlay();
+    }
+  }
+
+  function disableExternalAccount({ silent = false } = {}) {
+    externalAccountRuntime.activeId = null;
+    externalAccountRuntime.busy = false;
+    externalAccountRuntime.account = null;
+    externalAccountRuntime.accountError = null;
+    externalAccountRuntime.updatedAt = null;
+    externalAccountRuntime.quote = null;
+    externalAccountRuntime.result = null;
+    persistActiveExternalAccountId(null);
+    renderExternalAccountUi();
+    updateExternalGenerateButtonIndicator();
+    updateGenerateClickOverlay();
+    if (!silent) notify('当前标签页已恢复使用网页登录账号。', 'success');
+  }
+
+  function ensureExternalApiButtonStyle() {
+    if (document.getElementById(EXTERNAL_API_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = EXTERNAL_API_STYLE_ID;
+    style.textContent = `
+      button.image-gen-generate-button[${EXTERNAL_API_BUTTON_ATTR}="true"] {
+        position: relative !important;
+        overflow: visible !important;
+        box-shadow: inset 0 0 0 2px #f5f3c2, 0 0 12px rgba(245, 243, 194, 0.34) !important;
+        background-image: linear-gradient(135deg, rgba(245, 243, 194, 0.24), rgba(57, 217, 138, 0.14)) !important;
+      }
+      button.image-gen-generate-button[${EXTERNAL_API_BUTTON_ATTR}="true"]::after {
+        content: attr(${EXTERNAL_API_BADGE_ATTR});
+        position: absolute;
+        top: -9px;
+        left: 8px;
+        z-index: 5;
+        max-width: calc(100% - 16px);
+        padding: 1px 6px;
+        border: 1px solid #f5f3c2;
+        border-radius: 4px;
+        background: #141936;
+        color: #f5f3c2;
+        font: 700 10px/1.25 system-ui, sans-serif;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+      }
+    `;
+    (document.head || document.documentElement).append(style);
+  }
+
+  function updateExternalGenerateButtonIndicator() {
+    const buttons = Array.from(document.querySelectorAll('button.image-gen-generate-button'));
+    const active = imageRouteActive ? getActiveExternalAccount() : null;
+    if (!active) {
+      for (const button of buttons) {
+        if (button.hasAttribute(EXTERNAL_API_BUTTON_ATTR)) button.removeAttribute(EXTERNAL_API_BUTTON_ATTR);
+        if (button.hasAttribute(EXTERNAL_API_BADGE_ATTR)) button.removeAttribute(EXTERNAL_API_BADGE_ATTR);
+      }
+      return;
+    }
+    ensureExternalApiButtonStyle();
+    const badge = `外部API · ${active.label}`;
+    for (const button of buttons) {
+      if (button.getAttribute(EXTERNAL_API_BUTTON_ATTR) !== 'true') {
+        button.setAttribute(EXTERNAL_API_BUTTON_ATTR, 'true');
+      }
+      if (button.getAttribute(EXTERNAL_API_BADGE_ATTR) !== badge) {
+        button.setAttribute(EXTERNAL_API_BADGE_ATTR, badge);
+      }
+    }
+  }
+
+  function installExternalXhrInterceptor() {
+    if (typeof XMLHttpRequest === 'undefined') return;
+    const proto = XMLHttpRequest.prototype;
+    const nativeOpen = proto.open;
+    const nativeSetRequestHeader = proto.setRequestHeader;
+    const nativeSend = proto.send;
+
+    proto.open = function externalApiOpen(method, url, ...rest) {
+      this.__naiExternalMeta = {
+        method: String(method || 'GET').toUpperCase(),
+        url: String(url || ''),
+        authSet: false,
+      };
+      return nativeOpen.call(this, method, url, ...rest);
+    };
+
+    proto.setRequestHeader = function externalApiSetRequestHeader(name, value) {
+      const meta = this.__naiExternalMeta;
+      if (meta && (imageRouteActive || isImageRoute()) && String(name || '').toLowerCase() === 'authorization') {
+        const route = classifyExternalRoute(meta.url, meta.method);
+        const active = route?.kind === 'image' ? getActiveExternalAccount() : null;
+        if (active) {
+          meta.authSet = true;
+          meta.activeId = active.id;
+          meta.route = route.route;
+          return nativeSetRequestHeader.call(this, name, `Bearer ${active.token}`);
+        }
+      }
+      return nativeSetRequestHeader.call(this, name, value);
+    };
+
+    proto.send = function externalApiSend(body) {
+      const meta = this.__naiExternalMeta;
+      if (meta && (imageRouteActive || isImageRoute())) {
+        const route = classifyExternalRoute(meta.url, meta.method);
+        if (route?.kind === 'price' && typeof body === 'string') {
+          if (body.length <= 131_072 && body.trimStart().startsWith('{')) {
+            externalAccountRuntime.lastQuoteBody = body;
+            if (getActiveExternalAccount()) void queryExternalQuote(body);
+          }
+        } else if (route?.kind === 'image') {
+          const active = getActiveExternalAccount();
+          if (active) {
+            if (!meta.authSet) {
+              try {
+                nativeSetRequestHeader.call(this, 'Authorization', `Bearer ${active.token}`);
+              } catch {
+                // Ignore if XHR state rejects header injection.
+              }
+            }
+            const activeId = meta.activeId || active.id;
+            const routePath = meta.route || route.route;
+            let recorded = false;
+            this.addEventListener('loadend', () => {
+              if (recorded) return;
+              recorded = true;
+              const status = this.status > 0 ? this.status : 'network';
+              recordExternalImageResult(routePath, status, activeId);
+            }, { once: true });
+          }
+        }
+      }
+      return nativeSend.call(this, body);
+    };
+  }
+
+  restoreExternalAccountSelection();
+  installExternalXhrInterceptor();
+
   function openDatabase() {
     if (dbConnection) return Promise.resolve(dbConnection);
     if (dbPromise) return dbPromise;
@@ -1115,9 +1622,14 @@
   }
 
   function buildRequest(prepared, controller) {
+    const headers = new Headers(prepared.headers);
+    const activeExternal = getActiveExternalAccount();
+    if (activeExternal && classifyExternalRoute(prepared.url, prepared.method)?.kind === 'image') {
+      headers.set('Authorization', `Bearer ${activeExternal.token}`);
+    }
     const options = {
       method: prepared.method,
-      headers: new Headers(prepared.headers),
+      headers,
       body: prepared.method === 'GET' || prepared.method === 'HEAD' ? undefined : prepared.body,
       cache: prepared.cache,
       credentials: prepared.credentials,
@@ -1136,10 +1648,16 @@
     const controller = new AbortController();
     execution.controllers.add(controller);
     const timeoutId = nativeSetTimeout(() => controller.abort(new QueueTimeoutError()), GENERATION_TIMEOUT_MS);
+    const activeExternal = getActiveExternalAccount();
+    const externalRoute = activeExternal ? classifyExternalRoute(prepared.url, prepared.method) : null;
+    const externalAccountId = externalRoute?.kind === 'image' ? activeExternal.id : null;
     try {
       const request = buildRequest(prepared, controller);
-      return await nativeFetch(request);
+      const response = await nativeFetch(request);
+      if (externalAccountId) recordExternalImageResult(externalRoute.route, response.status, externalAccountId);
+      return response;
     } catch (error) {
+      if (externalAccountId) recordExternalImageResult(externalRoute.route, 'network', externalAccountId);
       if (controller.signal.aborted && controller.signal.reason instanceof QueueTimeoutError) {
         throw controller.signal.reason;
       }
@@ -1772,6 +2290,81 @@
     return { store: busyAccess.store, model: options.model, ...accesses };
   }
 
+  function readPromptChunksBackup(panel) {
+    const suffix = '\n\nClick to insert, drag to reorder';
+    const grouped = new Set();
+    function readChunk(card, order) {
+      const name = card.querySelector('span')?.textContent;
+      if (name == null || !card.title.endsWith(suffix)) throw new Error('无法完整读取 Chunk 正文，已取消备份。');
+      return { order, name, content: card.title.slice(0, -suffix.length), color: card.getAttribute('color') };
+    }
+    const cards = Array.from(panel.querySelectorAll('[draggable="true"][title]'));
+    const categories = Array.from(panel.querySelectorAll('button[title="Edit Category"]'), (button, order) => {
+      const header = button.parentElement;
+      const spans = header.querySelectorAll(':scope > span');
+      const name = spans[1]?.textContent;
+      const count = spans[2]?.textContent?.trim();
+      const members = cards.filter(card => header.parentElement.contains(card));
+      if (!name || !/^\d+$/.test(count || '') || members.length !== Number(count)) {
+        throw new Error(`请展开「${name || '未识别分组'}」并等待条目加载后再备份。`);
+      }
+      members.forEach(card => grouped.add(card));
+      return { order, name, color: header.getAttribute('color'), chunks: members.map(readChunk) };
+    });
+    // An unknown draggable layout must not silently turn a group into root entries.
+    if (panel.querySelectorAll('[draggable="true"]').length !== cards.length + categories.length
+        || cards.length !== panel.querySelectorAll('button[title="Edit Chunk"]').length) {
+      throw new Error('无法核对 Prompt Chunks 面板结构，已取消备份。');
+    }
+    if (!cards.length && !categories.length) throw new Error('当前面板没有可备份的 Chunks。');
+    return {
+      format: 'novelai-prompt-chunks-local-backup', version: 1, source: 'https://novelai.net/image',
+      totalChunks: cards.length, uncategorized: cards.filter(card => !grouped.has(card)).map(readChunk),
+      categories, exportedAt: new Date().toISOString(),
+    };
+  }
+
+  function savePromptChunksBackup(panel, type) {
+    const backup = readPromptChunksBackup(panel);
+    const groups = [{ name: '未分组', chunks: backup.uncategorized }, ...backup.categories];
+    const content = type === 'json' ? JSON.stringify(backup, null, 2) + '\n'
+      : [`NovelAI Prompt Chunks（共 ${backup.totalChunks} 条）`, ...groups.flatMap(group => [
+        `===== ${group.name}（${group.chunks.length}） =====`,
+        ...group.chunks.map(chunk => `【${chunk.name}】\n颜色：${chunk.color}\n${chunk.content}`),
+      ])].join('\n\n') + '\n';
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(new Blob([content], {
+      type: type === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8',
+    }));
+    link.href = url;
+    link.download = `novelai-prompt-chunks-${backup.exportedAt.replace(/[:.]/g, '-')}.${type}`;
+    try { link.click(); } finally { nativeSetTimeout(() => URL.revokeObjectURL(url), 30_000); }
+    notify(`已发起备份下载：${backup.totalChunks} 个 Chunks。`, 'success');
+  }
+
+  function installPromptChunkBackupButtons() {
+    if (!isImageRoute()) return;
+    const panel = document.getElementById('promptChunkContainer');
+    const add = panel?.querySelector('button[title="Add Prompt Chunk"]');
+    if (!add || panel.querySelector('[data-nai-chunks-backup]')) return;
+    const row = document.createElement('div');
+    row.dataset.naiChunksBackup = '';
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:4px 0';
+    for (const type of ['json', 'txt']) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '备份 ' + type.toUpperCase();
+      button.style.cssText = 'cursor:pointer;color:inherit;background:transparent;border:1px solid currentColor;border-radius:4px;padding:3px 8px';
+      button.addEventListener('click', event => {
+        event.stopPropagation();
+        try { savePromptChunksBackup(panel, type); }
+        catch (error) { notify(error.message || String(error), 'error'); }
+      });
+      row.append(button);
+    }
+    add.parentElement.parentElement.after(row);
+  }
+
   function normalizeExportCharacters(params) {
     const characterPrompts = params?.characterPrompts;
     if (!Array.isArray(characterPrompts)) throw new Error('无法读取 Character Prompt。');
@@ -2230,7 +2823,12 @@
     }
     let response;
     try {
-      response = await nativeFetch(input, init);
+      const url = input instanceof Request ? input.url : input;
+      const method = init?.method || (input instanceof Request ? input.method : 'POST');
+      const externalRoute = classifyExternalRoute(url, method);
+      response = externalRoute?.kind === 'image'
+        ? await fetchWithExternalAccount(input, init, externalRoute.route)
+        : await nativeFetch(input, init);
       void drainResponse(response).finally(async () => {
         const state = await loadState();
         await sleep(state.settings.interJobDelayMs);
@@ -2726,6 +3324,15 @@
 
   window.fetch = async function queuedFetch(input, init) {
     const url = input instanceof Request ? input.url : input;
+    const method = init?.method || (input instanceof Request ? input.method : 'GET');
+    const externalRoute = (imageRouteActive || isImageRoute()) ? classifyExternalRoute(url, method) : null;
+    if (externalRoute?.kind === 'price') {
+      captureExternalPriceFromFetch(input, init);
+      return nativeFetch(input, init);
+    }
+    if (externalRoute?.kind === 'image' && !isGenerationUrl(url)) {
+      return fetchWithExternalAccount(input, init, externalRoute.route);
+    }
     if (!imageRouteActive || !isGenerationUrl(url)) return nativeFetch(input, init);
 
     const captureSession = consumeCaptureSession();
@@ -2832,6 +3439,10 @@
     const queueMode = shouldCaptureGenerateClick() || enqueueCaptureInFlight;
     overlay.dataset.mode = queueMode ? 'queue' : 'blocked';
     overlay.dataset.capturing = enqueueCaptureInFlight ? 'true' : 'false';
+    const activeExternal = getActiveExternalAccount();
+    overlay.dataset.externalApi = activeExternal ? 'true' : 'false';
+    if (activeExternal) overlay.dataset.externalBadge = `外部API · ${activeExternal.label}`;
+    else delete overlay.dataset.externalBadge;
     const label = overlay.querySelector('.generate-hitbox-label');
     const cost = overlay.querySelector('.generate-hitbox-cost');
     const costValue = overlay.querySelector('.generate-hitbox-cost-value');
@@ -3828,6 +4439,220 @@
     scheduleRefresh();
   }
 
+  async function openExternalAccountPanel() {
+    await saveState({ collapsed: false, activeTab: 'special', specialTab: 'account' });
+    scheduleRefresh();
+  }
+
+  function resetExternalAccountForm() {
+    externalAccountRuntime.editingId = null;
+    if (!shadow) return;
+    const title = shadow.querySelector('.ext-form-title');
+    const labelInput = shadow.querySelector('.ext-label-input');
+    const tokenInput = shadow.querySelector('.ext-token-input');
+    const toggleVis = shadow.querySelector('.ext-token-visibility');
+    const cancelBtn = shadow.querySelector('.ext-form-cancel');
+    if (title) title.textContent = '添加外部 API';
+    if (labelInput) labelInput.value = '';
+    if (tokenInput) {
+      tokenInput.value = '';
+      tokenInput.type = 'password';
+    }
+    if (toggleVis) toggleVis.textContent = '显示';
+    if (cancelBtn) cancelBtn.hidden = true;
+  }
+
+  function startEditingExternalAccount(accountId) {
+    const target = savedExternalAccounts.find((item) => item.id === accountId);
+    if (!target || !shadow) return;
+    externalAccountRuntime.editingId = target.id;
+    shadow.querySelector('.ext-form-title').textContent = `编辑外部 API：${target.label}`;
+    shadow.querySelector('.ext-label-input').value = target.label;
+    const tokenInput = shadow.querySelector('.ext-token-input');
+    tokenInput.value = target.token;
+    tokenInput.type = 'password';
+    shadow.querySelector('.ext-token-visibility').textContent = '显示';
+    shadow.querySelector('.ext-form-cancel').hidden = false;
+    shadow.querySelector('.ext-label-input').focus();
+  }
+
+  async function saveExternalAccountFromForm({ activateAfter = false } = {}) {
+    if (!shadow) return;
+    const labelInput = shadow.querySelector('.ext-label-input');
+    const tokenInput = shadow.querySelector('.ext-token-input');
+    let token;
+    try {
+      token = normalizeExternalApiKey(tokenInput.value);
+    } catch (error) {
+      notify(error.message || String(error), 'error');
+      tokenInput.focus();
+      return;
+    }
+    const label = normalizeWhitespace(labelInput.value) || maskExternalApiKey(token);
+    const timestamp = now();
+    let targetId = externalAccountRuntime.editingId;
+    if (targetId && savedExternalAccounts.some((item) => item.id === targetId)) {
+      const next = savedExternalAccounts.map((item) => (
+        item.id === targetId ? { ...item, label, token, updatedAt: timestamp } : item
+      ));
+      persistSavedExternalAccounts(next);
+      notify(`已更新外部 API：${label}`, 'success');
+    } else {
+      targetId = crypto.randomUUID();
+      persistSavedExternalAccounts([
+        ...savedExternalAccounts,
+        { id: targetId, label, token, createdAt: timestamp, updatedAt: timestamp },
+      ]);
+      notify(`已保存外部 API：${label}`, 'success');
+    }
+    resetExternalAccountForm();
+    renderExternalAccountUi();
+    updateExternalGenerateButtonIndicator();
+    updateGenerateClickOverlay();
+    if (activateAfter || externalAccountRuntime.activeId === targetId) {
+      await activateExternalAccount(targetId);
+    }
+  }
+
+  function deleteSavedExternalAccount(accountId) {
+    const target = savedExternalAccounts.find((item) => item.id === accountId);
+    if (!target) return;
+    const wasActive = externalAccountRuntime.activeId === target.id;
+    persistSavedExternalAccounts(savedExternalAccounts.filter((item) => item.id !== target.id));
+    if (externalAccountRuntime.editingId === target.id) resetExternalAccountForm();
+    if (wasActive) {
+      disableExternalAccount({ silent: true });
+      notify(`已删除正在使用的外部 API「${target.label}」，本标签页已恢复网页账号。`, 'success');
+    } else {
+      renderExternalAccountUi();
+      notify(`已删除外部 API：${target.label}`, 'success');
+    }
+  }
+
+  function renderExternalAccountUi() {
+    if (!shadow) return;
+    const active = getActiveExternalAccount();
+    const summary = externalAccountRuntime.account;
+    const shortcut = shadow.querySelector('.external-api-shortcut');
+    if (shortcut) {
+      shortcut.classList.toggle('active', Boolean(active));
+      shortcut.title = active
+        ? `当前使用外部 API：${active.label}；点击管理或切换`
+        : '打开外部 API 账号切换（当前使用网页账号）';
+    }
+
+    const bar = shadow.querySelector('.external-account-bar');
+    if (bar) {
+      bar.hidden = !active;
+      if (active) {
+        bar.querySelector('.external-account-bar-label').textContent = `外部 API · ${active.label}`;
+        const parts = [];
+        if (summary?.total !== null && summary?.total !== undefined) parts.push(`${summary.total} Anlas`);
+        else if (externalAccountRuntime.busy) parts.push('查询中…');
+        if (summary?.opus && summary.percent !== null && summary.percent !== undefined) parts.push(`电池 ${summary.percent}%`);
+        if (externalAccountRuntime.quote?.amount !== null && externalAccountRuntime.quote?.amount !== undefined) {
+          parts.push(`报价 ${externalAccountRuntime.quote.amount}`);
+        }
+        bar.querySelector('.external-account-bar-detail').textContent = parts.join(' · ') || '点击查看详情';
+        bar.title = `当前标签页生图使用外部 API（${active.label}）；点击管理`;
+      }
+    }
+
+    const statusText = shadow.querySelector('.ext-status-text');
+    const details = shadow.querySelector('.ext-details');
+    const statusActions = shadow.querySelector('.ext-status-actions');
+    const errorEl = shadow.querySelector('.ext-error');
+    const refreshBtn = shadow.querySelector('.ext-refresh');
+    const disableBtn = shadow.querySelector('.ext-disable');
+    if (statusText) {
+      statusText.textContent = active
+        ? `当前标签页：外部 API · ${active.label}`
+        : '当前标签页：网页登录账号（独立生效）';
+    }
+    if (statusActions) statusActions.hidden = !active;
+    if (refreshBtn) refreshBtn.disabled = externalAccountRuntime.busy || !active;
+    if (disableBtn) disableBtn.disabled = externalAccountRuntime.busy || !active;
+    if (errorEl) {
+      errorEl.hidden = !externalAccountRuntime.accountError;
+      errorEl.textContent = externalAccountRuntime.accountError || '';
+    }
+    if (details) {
+      details.hidden = !active;
+      if (active) {
+        shadow.querySelector('.ext-balance').textContent = !summary
+          ? (externalAccountRuntime.busy ? '查询中…' : '未返回')
+          : summary.total === null
+            ? '未返回'
+            : `${summary.total}（订阅 ${summary.monthly ?? '—'}，购买 ${summary.purchased ?? '—'}）`;
+        shadow.querySelector('.ext-tier').textContent = !summary
+          ? (externalAccountRuntime.busy ? '查询中…' : '未返回')
+          : `${summary.tier ?? '未返回'}${summary.active === false ? '（未生效）' : ''}`;
+        shadow.querySelector('.ext-battery').textContent = !summary
+          ? (externalAccountRuntime.busy ? '查询中…' : '未返回')
+          : !summary.opus
+            ? '无有效 Opus 订阅'
+            : summary.percent === null
+              ? '额度未返回'
+              : `${summary.percent}%${formatExternalRecoveryTimer(summary.nextPercentSeconds)}`;
+        shadow.querySelector('.ext-quote').textContent = externalAccountRuntime.quote?.amount !== null
+          && externalAccountRuntime.quote?.amount !== undefined
+          ? `${externalAccountRuntime.quote.amount} Anlas · ${new Date(externalAccountRuntime.quote.at).toLocaleTimeString()}`
+          : '等待网页触发报价';
+        shadow.querySelector('.ext-result').textContent = formatExternalRequestResult(externalAccountRuntime.result);
+      }
+    }
+
+    const listEl = shadow.querySelector('.ext-account-list');
+    if (listEl) {
+      listEl.replaceChildren();
+      if (!savedExternalAccounts.length) {
+        const empty = document.createElement('div');
+        empty.className = 'ext-empty';
+        empty.textContent = '还没有保存外部 API Key，请在下方添加。';
+        listEl.append(empty);
+      } else {
+        for (const item of savedExternalAccounts) {
+          const isCurrent = item.id === externalAccountRuntime.activeId;
+          const card = document.createElement('div');
+          card.className = `ext-account-item${isCurrent ? ' active' : ''}`;
+          const info = document.createElement('div');
+          info.className = 'ext-account-info';
+          const name = document.createElement('strong');
+          name.textContent = item.label;
+          const keyMask = document.createElement('small');
+          keyMask.textContent = maskExternalApiKey(item.token);
+          info.append(name, keyMask);
+
+          const actions = document.createElement('div');
+          actions.className = 'ext-account-actions';
+          const useBtn = document.createElement('button');
+          useBtn.type = 'button';
+          useBtn.className = isCurrent ? 'primary' : '';
+          useBtn.textContent = isCurrent ? '使用中' : '启用';
+          useBtn.disabled = externalAccountRuntime.busy || isCurrent;
+          useBtn.addEventListener('click', () => void activateExternalAccount(item.id));
+
+          const editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.textContent = '编辑';
+          editBtn.disabled = externalAccountRuntime.busy;
+          editBtn.addEventListener('click', () => startEditingExternalAccount(item.id));
+
+          const delBtn = document.createElement('button');
+          delBtn.type = 'button';
+          delBtn.className = 'danger';
+          delBtn.textContent = '删除';
+          delBtn.disabled = externalAccountRuntime.busy;
+          delBtn.addEventListener('click', () => deleteSavedExternalAccount(item.id));
+
+          actions.append(useBtn, editBtn, delBtn);
+          card.append(info, actions);
+          listEl.append(card);
+        }
+      }
+    }
+  }
+
   function renderPromptImportUi() {
     if (!shadow) return;
     const textarea = shadow.querySelector('.prompt-import-text');
@@ -3865,8 +4690,10 @@
         * { box-sizing: border-box; }
         .panel { position: fixed; top: 112px; right: 16px; z-index: 2147483000; width: 380px; max-width: calc(100vw - 24px); max-height: min(72vh, 760px); display: flex; flex-direction: column; color: #fff; background: #141936; border: 1px solid #343a63; border-radius: 10px; box-shadow: 0 14px 42px rgba(0,0,0,.45); font: 14px/1.4 "Source Sans Pro", system-ui, sans-serif; overflow: hidden; pointer-events: auto; }
         .panel.collapsed .body, .panel.collapsed .tabs { display: none; }
-        .header { display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: #191b31; border-bottom: 1px solid #343a63; cursor: move; user-select: none; }
-        .title { min-width: 0; flex: 1; font: 600 15px/1.2 Eczar, system-ui, sans-serif; color: #f5f3c2; }
+        .header { display: flex; align-items: center; gap: 5px; padding: 9px 10px; background: #191b31; border-bottom: 1px solid #343a63; cursor: move; user-select: none; }
+        .title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 15px/1.2 Eczar, system-ui, sans-serif; color: #f5f3c2; }
+        .header button:not(.collapse) { padding: 5px 7px; white-space: nowrap; }
+        .external-api-shortcut.active { color: #141936; background: #f5f3c2; border-color: #f5f3c2; }
         button { border: 1px solid #41486f; border-radius: 6px; padding: 5px 9px; color: #fff; background: #22253f; font: 600 12px/1.25 system-ui, sans-serif; cursor: pointer; }
         button:hover { border-color: #777fae; background: #2c3153; }
         button.danger { color: #ffc5c5; border-color: #744a57; }
@@ -3889,8 +4716,47 @@
         .tabs { display: grid; grid-template-columns: 1fr 1fr 1.15fr; gap: 6px; padding: 8px 10px 0; }
         .tabs button span { margin-left: 9px; }
         .tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
-        .special-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 9px; }
+        .special-tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 9px; }
         .special-tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
+        .external-account-bar { display: flex; width: 100%; min-height: 26px; align-items: center; justify-content: space-between; gap: 8px; overflow: hidden; padding: 4px 10px; color: #f5f3c2; background: #1c2246; border: 0; border-bottom: 1px solid rgba(245,243,194,.32); border-radius: 0; font-size: 11px; font-weight: 600; text-align: left; white-space: nowrap; }
+        .external-account-bar:hover { background: #232a54; border-color: rgba(245,243,194,.55); }
+        .external-account-bar[hidden] { display: none; }
+        .external-account-bar-main { display: inline-flex; min-width: 0; align-items: center; gap: 6px; overflow: hidden; }
+        .external-account-bar-dot { width: 6px; height: 6px; flex: 0 0 6px; background: #f5f3c2; border-radius: 50%; box-shadow: 0 0 0 2px rgba(245,243,194,.2); }
+        .external-account-bar-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .external-account-bar-detail { flex: 0 0 auto; color: #cfd5ff; font-weight: 500; }
+        .external-account-view { display: flex; flex-direction: column; gap: 9px; }
+        .ext-card { padding: 9px; background: #191d3a; border: 1px solid #363d66; border-radius: 8px; }
+        .ext-status-text { color: #f5f3c2; font-size: 12px; font-weight: 700; }
+        .ext-details { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 4px 8px; margin: 8px 0 0; font-size: 12px; }
+        .ext-details[hidden] { display: none; }
+        .ext-details dt { color: #969dc7; }
+        .ext-details dd { margin: 0; color: #edf0ff; overflow-wrap: anywhere; }
+        .ext-error { margin-top: 7px; padding: 6px 8px; color: #ffb6bf; background: rgba(169,78,97,.18); border: 1px solid #784252; border-radius: 6px; font-size: 11px; overflow-wrap: anywhere; }
+        .ext-error[hidden] { display: none; }
+        .ext-status-actions { display: flex; gap: 6px; margin-top: 8px; }
+        .ext-status-actions[hidden] { display: none; }
+        .ext-status-actions button { flex: 1 1 auto; }
+        .ext-section-title { color: #c5cae9; font-size: 12px; font-weight: 600; }
+        .ext-account-list { display: flex; flex-direction: column; gap: 6px; }
+        .ext-empty { padding: 14px 10px; color: #989fca; text-align: center; border: 1px dashed #3a406a; border-radius: 8px; font-size: 12px; }
+        .ext-account-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 9px; background: #191d3a; border: 1px solid #363d66; border-left: 3px solid #5c6496; border-radius: 8px; }
+        .ext-account-item.active { border-left-color: #f5f3c2; border-color: rgba(245,243,194,.55); background: #20264c; }
+        .ext-account-info { min-width: 0; flex: 1; }
+        .ext-account-info strong { display: block; color: #fff; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ext-account-info small { display: block; margin-top: 2px; color: #969dc7; font: 11px/1.3 ui-monospace, Consolas, monospace; }
+        .ext-account-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+        .ext-account-actions button { padding: 4px 7px; font-size: 11px; }
+        .ext-form { display: flex; flex-direction: column; gap: 7px; padding: 9px; background: #191d3a; border: 1px solid #363d66; border-radius: 8px; }
+        .ext-form-title { color: #f5f3c2; font-size: 12px; font-weight: 700; }
+        .ext-form input { width: 100%; padding: 6px 8px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 6px; font: 12px/1.4 system-ui, sans-serif; }
+        .ext-token-row { display: flex; gap: 6px; }
+        .ext-token-row input { flex: 1; font-family: ui-monospace, Consolas, monospace; }
+        .ext-token-row button { flex: 0 0 auto; }
+        .ext-form-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+        .ext-form-actions button { flex: 1 1 auto; }
+        .ext-form-cancel[hidden] { display: none; }
+        .ext-help { color: #969dc7; font-size: 11px; }
         .body { min-height: 140px; overflow: auto; padding: 8px 10px 10px; }
         .view[hidden] { display: none; }
         .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 8px; }
@@ -3966,6 +4832,8 @@
         .generate-hitbox-cost-value { min-width: 20px; text-align: center; }
         .generate-hitbox-cost-icon { width: 10px; height: 10px; flex: 0 0 10px; background: rgb(112, 119, 194); mask-position: center; mask-repeat: no-repeat; mask-size: contain; }
         .generate-hitbox[data-paused="true"] { cursor: not-allowed; }
+        .generate-hitbox[data-external-api="true"] { box-shadow: inset 0 0 0 2px #f5f3c2, 0 0 12px rgba(245, 243, 194, 0.34); }
+        .generate-hitbox[data-external-api="true"]::after { content: attr(data-external-badge); position: absolute; top: -9px; left: 8px; max-width: calc(100% - 16px); padding: 1px 6px; border: 1px solid #f5f3c2; border-radius: 4px; background: #141936; color: #f5f3c2; font: 700 10px/1.25 system-ui, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; box-shadow: 0 2px 6px rgba(0,0,0,.45); }
         .generate-hitbox[hidden] { display: none; }
         @media (max-width: 700px) { .panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 64vh; } }
       </style>
@@ -3973,11 +4841,13 @@
         <header class="header">
           <div class="title">NAI Image Workbench</div>
           <button class="queue-toggle primary" type="button" title="控制等待队列；与设置中的“启用等待队列”是同一个开关">禁用</button>
+          <button class="external-api-shortcut" type="button" title="打开外部 API 账号切换（当前使用网页账号）">API</button>
           <button class="prompt-export" type="button" title="单击打开导入/导出；双击直接复制当前 NAI5 Prompt">导入/导出</button>
           <button class="settings" type="button">设置</button>
           <button class="collapse" type="button" title="展开面板" aria-label="展开面板">+</button>
         </header>
         <button class="queue-status-bar" type="button" data-tone="idle" title="展开并查看队列" aria-label="队列状态：队列空闲；点击查看队列"><span class="queue-status-main"><span class="queue-status-dot" aria-hidden="true"></span><span class="queue-status-label">队列空闲</span></span><span class="queue-status-detail" hidden></span></button>
+        <button class="external-account-bar" type="button" hidden><span class="external-account-bar-main"><span class="external-account-bar-dot" aria-hidden="true"></span><span class="external-account-bar-label"></span></span><span class="external-account-bar-detail"></span></button>
         <nav class="tabs">
           <button type="button" data-tab="queue">队列<span class="queue-count">0</span></button>
           <button type="button" data-tab="finished">已结束<span class="finished-count">0</span></button>
@@ -3994,6 +4864,7 @@
             <nav class="special-tabs">
               <button type="button" data-special-tab="prompt">Prompt 导入/导出</button>
               <button type="button" data-special-tab="batch">批量替换</button>
+              <button type="button" data-special-tab="account">外部 API</button>
             </nav>
             <div class="prompt-import-view special-subview">
               <textarea class="prompt-import-text" spellcheck="false" placeholder="[NAI5_PROMPT_V1]&#10;&#10;[MAIN]&#10;主正面提示词&#10;&#10;[CHARACTER]&#10;[POSITION]&#10;0.5, 0.5&#10;[PROMPT]&#10;Character 正面提示词&#10;&#10;[END]"></textarea>
@@ -4032,6 +4903,39 @@
               <div class="batch-controls batch-running-controls" hidden>
                 <button class="batch-discard danger" type="button">完成后丢弃记录并停止</button>
               </div>
+            </div>
+            <div class="external-account-view special-subview" hidden>
+              <div class="ext-card">
+                <div class="ext-status-text">当前标签页：网页登录账号（独立生效）</div>
+                <dl class="ext-details" hidden>
+                  <dt>Anlas</dt><dd class="ext-balance">—</dd>
+                  <dt>订阅</dt><dd class="ext-tier">—</dd>
+                  <dt>Opus 电池</dt><dd class="ext-battery">—</dd>
+                  <dt>最近报价</dt><dd class="ext-quote">等待网页触发报价</dd>
+                  <dt>最近请求</dt><dd class="ext-result">尚无</dd>
+                </dl>
+                <div class="ext-error" hidden></div>
+                <div class="ext-status-actions" hidden>
+                  <button class="ext-refresh" type="button">刷新额度</button>
+                  <button class="ext-disable danger" type="button">恢复网页账号</button>
+                </div>
+              </div>
+              <div class="ext-section-title">已保存的外部 API（持久化 · 当前标签页独立生效）</div>
+              <div class="ext-account-list"></div>
+              <form class="ext-form" autocomplete="off">
+                <div class="ext-form-title">添加外部 API</div>
+                <input class="ext-label-input" type="text" maxlength="40" placeholder="备注名，例如：备用 Opus 号">
+                <div class="ext-token-row">
+                  <input class="ext-token-input" type="password" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="粘贴 NovelAI API Key（无需 Bearer）">
+                  <button class="ext-token-visibility" type="button">显示</button>
+                </div>
+                <div class="ext-form-actions">
+                  <button class="ext-form-save" type="submit">保存</button>
+                  <button class="ext-form-save-use primary" type="button">保存并启用</button>
+                  <button class="ext-form-cancel" type="button" hidden>取消编辑</button>
+                </div>
+                <small class="ext-help">独立拦截生图/放大/图像工具/Vibe 编码请求替换 Key，不依赖等待队列；刷新本页后保持生效。</small>
+              </form>
             </div>
           </div>
         </div>
@@ -4073,6 +4977,25 @@
     document.documentElement.append(uiHost);
 
     shadow.querySelector('.queue-toggle').addEventListener('click', () => void toggleQueueControl());
+    shadow.querySelector('.external-api-shortcut').addEventListener('click', () => void openExternalAccountPanel());
+    shadow.querySelector('.external-account-bar').addEventListener('click', () => void openExternalAccountPanel());
+    shadow.querySelector('.ext-refresh').addEventListener('click', () => void refreshExternalAccountSummary({ alsoQuote: true }));
+    shadow.querySelector('.ext-disable').addEventListener('click', () => disableExternalAccount());
+    shadow.querySelector('.ext-token-visibility').addEventListener('click', () => {
+      const input = shadow.querySelector('.ext-token-input');
+      const btn = shadow.querySelector('.ext-token-visibility');
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      btn.textContent = show ? '隐藏' : '显示';
+    });
+    shadow.querySelector('.ext-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      void saveExternalAccountFromForm({ activateAfter: false });
+    });
+    shadow.querySelector('.ext-form-save-use').addEventListener('click', () => {
+      void saveExternalAccountFromForm({ activateAfter: true });
+    });
+    shadow.querySelector('.ext-form-cancel').addEventListener('click', () => resetExternalAccountForm());
     shadow.querySelector('.prompt-export').addEventListener('click', (event) => {
       if (event.detail > 1) return;
       if (promptExportClickTimer) nativeClearTimeout(promptExportClickTimer);
@@ -4404,7 +5327,7 @@
     shadow.querySelector('.batch-count').textContent = String(cachedState.batch.items.length + (cachedState.batch.current ? 1 : 0));
     shadow.querySelectorAll('[data-tab]').forEach((button) => button.classList.toggle('active', button.dataset.tab === cachedState.activeTab));
 
-    const specialTab = ['prompt', 'batch'].includes(cachedState.specialTab) ? cachedState.specialTab : 'prompt';
+    const specialTab = ['prompt', 'batch', 'account'].includes(cachedState.specialTab) ? cachedState.specialTab : 'prompt';
     shadow.querySelector('.queue-view').hidden = cachedState.activeTab === 'special';
     shadow.querySelector('.special-view').hidden = cachedState.activeTab !== 'special';
     shadow.querySelectorAll('[data-special-tab]').forEach((button) => {
@@ -4412,8 +5335,11 @@
     });
     shadow.querySelector('.prompt-import-view').hidden = specialTab !== 'prompt';
     shadow.querySelector('.batch-view').hidden = specialTab !== 'batch';
+    shadow.querySelector('.external-account-view').hidden = specialTab !== 'account';
     renderPromptImportUi();
     renderBatchUi(cachedState.batch);
+    renderExternalAccountUi();
+    updateExternalGenerateButtonIndicator();
 
     const shown = cachedState.activeTab === 'finished' ? finished : [...pendingSnapshots, ...queued];
     const list = shadow.querySelector('.list');
@@ -4451,6 +5377,7 @@
     if (uiHost) uiHost.style.display = active ? '' : 'none';
     if (!active) {
       updateGenerateClickOverlay();
+      updateExternalGenerateButtonIndicator();
       return;
     }
     if (!initialized && !initializationPromise) {
@@ -4523,9 +5450,28 @@
     await refreshBusyCache();
     buildUi();
     await refreshUi();
+    if (getActiveExternalAccount()) {
+      void refreshExternalAccountSummary({ silent: true });
+    }
 
-    const observer = new MutationObserver(() => {
+    window.addEventListener('storage', (event) => {
+      if (event.key !== EXTERNAL_ACCOUNTS_STORAGE_KEY) return;
+      loadSavedExternalAccounts();
+      if (externalAccountRuntime.activeId && !getActiveExternalAccount()) {
+        disableExternalAccount({ silent: true });
+        notify('当前标签页使用的外部 API 已在其他标签页被删除，已恢复网页账号。', 'error');
+        return;
+      }
+      renderExternalAccountUi();
+      updateExternalGenerateButtonIndicator();
       updateGenerateClickOverlay();
+    });
+
+    installPromptChunkBackupButtons();
+    const observer = new MutationObserver(() => {
+      installPromptChunkBackupButtons();
+      updateGenerateClickOverlay();
+      updateExternalGenerateButtonIndicator();
       scheduleHistorySaveIndicatorUpdate();
     });
     observer.observe(document.documentElement, {

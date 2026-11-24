@@ -24,6 +24,14 @@ NovelAI 空闲时，Generate 仍然是原来的 Generate，行为完全不变。
 
 面板顶部的“导入/导出”按钮单击会打开工具，双击会直接复制当前配置。文本使用 `[NAI5_PROMPT_V1]` 标记格式，完整语法与转义规则见 [NAI5 Prompt 格式规范](docs/NAI5_PROMPT_V1.md)。读取、校验和应用表单均不会触发图片生成。
 
+## Prompt Chunks 本地备份
+
+打开 NovelAI 的 **Prompt Chunks** 面板，展开分组，点击 **备份 JSON** 或 **备份 TXT**。文件保留条目的名称、完整正文、颜色、分组和排列顺序，保存到浏览器下载位置。
+
+需要在打开图像页时自动备份到自己的 GitHub 私有仓库，可单独安装 [Chunks GitHub 同步脚本](nai-chunks-github-sync.user.js)，按[配置说明](docs/CHUNKS_GITHUB_SYNC.md)启用。它不依赖工作台。
+
+需要在打开图像页时自动备份到自己的 GitHub 私有仓库，可单独安装 [Chunks GitHub 同步脚本](nai-chunks-github-sync.user.js)，按[配置说明](docs/CHUNKS_GITHUB_SYNC.md)启用。它不依赖工作台。
+
 ## 批量 Prompt 替换
 
 在“特殊功能”中的“批量替换”里使用。先在 Base Prompt 中放入一个占位符：
