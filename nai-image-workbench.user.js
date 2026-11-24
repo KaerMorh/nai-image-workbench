@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.9.0
+// @version      0.9.1
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.9.0';
+  const SCRIPT_VERSION = '0.9.1';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -4456,7 +4456,7 @@
     if (labelInput) labelInput.value = '';
     if (tokenInput) {
       tokenInput.value = '';
-      tokenInput.type = 'password';
+      tokenInput.classList.add('masked');
     }
     if (toggleVis) toggleVis.textContent = '显示';
     if (cancelBtn) cancelBtn.hidden = true;
@@ -4470,7 +4470,7 @@
     shadow.querySelector('.ext-label-input').value = target.label;
     const tokenInput = shadow.querySelector('.ext-token-input');
     tokenInput.value = target.token;
-    tokenInput.type = 'password';
+    tokenInput.classList.add('masked');
     shadow.querySelector('.ext-token-visibility').textContent = '显示';
     shadow.querySelector('.ext-form-cancel').hidden = false;
     shadow.querySelector('.ext-label-input').focus();
@@ -4716,7 +4716,8 @@
         .tabs { display: grid; grid-template-columns: 1fr 1fr 1.15fr; gap: 6px; padding: 8px 10px 0; }
         .tabs button span { margin-left: 9px; }
         .tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
-        .special-tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-bottom: 9px; }
+        .special-tabs { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 6px; margin-bottom: 9px; }
+        .special-tabs button { padding: 5px 6px; font-size: 11px; white-space: nowrap; }
         .special-tabs button.active { color: #f5f3c2; border-color: #8e926e; background: #30334a; }
         .external-account-bar { display: flex; width: 100%; min-height: 26px; align-items: center; justify-content: space-between; gap: 8px; overflow: hidden; padding: 4px 10px; color: #f5f3c2; background: #1c2246; border: 0; border-bottom: 1px solid rgba(245,243,194,.32); border-radius: 0; font-size: 11px; font-weight: 600; text-align: left; white-space: nowrap; }
         .external-account-bar:hover { background: #232a54; border-color: rgba(245,243,194,.55); }
@@ -4749,7 +4750,9 @@
         .ext-account-actions button { padding: 4px 7px; font-size: 11px; }
         .ext-form { display: flex; flex-direction: column; gap: 7px; padding: 9px; background: #191d3a; border: 1px solid #363d66; border-radius: 8px; }
         .ext-form-title { color: #f5f3c2; font-size: 12px; font-weight: 700; }
+        .ext-field-label { display: block; color: #aeb5da; font-size: 11px; margin-bottom: -3px; }
         .ext-form input { width: 100%; padding: 6px 8px; color: #fff; background: #0f1430; border: 1px solid #41486f; border-radius: 6px; font: 12px/1.4 system-ui, sans-serif; }
+        .ext-token-input.masked { -webkit-text-security: disc; }
         .ext-token-row { display: flex; gap: 6px; }
         .ext-token-row input { flex: 1; font-family: ui-monospace, Consolas, monospace; }
         .ext-token-row button { flex: 0 0 auto; }
@@ -4922,20 +4925,22 @@
               </div>
               <div class="ext-section-title">已保存的外部 API（持久化 · 当前标签页独立生效）</div>
               <div class="ext-account-list"></div>
-              <form class="ext-form" autocomplete="off">
+              <div class="ext-form" role="region" aria-label="添加外部 API">
                 <div class="ext-form-title">添加外部 API</div>
-                <input class="ext-label-input" type="text" maxlength="40" placeholder="备注名，例如：备用 Opus 号">
+                <span class="ext-field-label">备注名</span>
+                <input class="ext-label-input" type="text" name="nai_workbench_ext_label" maxlength="40" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="备注名，例如：备用 Opus 号">
+                <span class="ext-field-label">NovelAI API Key</span>
                 <div class="ext-token-row">
-                  <input class="ext-token-input" type="password" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="粘贴 NovelAI API Key（无需 Bearer）">
+                  <input class="ext-token-input masked" type="text" name="nai_workbench_ext_token" maxlength="2048" autocomplete="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="粘贴 NovelAI API Key（无需 Bearer）">
                   <button class="ext-token-visibility" type="button">显示</button>
                 </div>
                 <div class="ext-form-actions">
-                  <button class="ext-form-save" type="submit">保存</button>
+                  <button class="ext-form-save" type="button">保存</button>
                   <button class="ext-form-save-use primary" type="button">保存并启用</button>
                   <button class="ext-form-cancel" type="button" hidden>取消编辑</button>
                 </div>
                 <small class="ext-help">独立拦截生图/放大/图像工具/Vibe 编码请求替换 Key，不依赖等待队列；刷新本页后保持生效。</small>
-              </form>
+              </div>
             </div>
           </div>
         </div>
@@ -4984,12 +4989,10 @@
     shadow.querySelector('.ext-token-visibility').addEventListener('click', () => {
       const input = shadow.querySelector('.ext-token-input');
       const btn = shadow.querySelector('.ext-token-visibility');
-      const show = input.type === 'password';
-      input.type = show ? 'text' : 'password';
-      btn.textContent = show ? '隐藏' : '显示';
+      const isMasked = input.classList.toggle('masked');
+      btn.textContent = isMasked ? '显示' : '隐藏';
     });
-    shadow.querySelector('.ext-form').addEventListener('submit', (event) => {
-      event.preventDefault();
+    shadow.querySelector('.ext-form-save').addEventListener('click', () => {
       void saveExternalAccountFromForm({ activateAfter: false });
     });
     shadow.querySelector('.ext-form-save-use').addEventListener('click', () => {
