@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.9.3
+// @version      0.9.4
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.9.3';
+  const SCRIPT_VERSION = '0.9.4';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -125,6 +125,7 @@
     updatedAt: null,
     quote: null,
     lastQuoteBody: null,
+    lastMeasuredCost: null,
     result: null,
     editingId: null,
     dashboardScope: 'current',
@@ -1213,7 +1214,9 @@
     if (!accountId || externalAccountRuntime.activeId !== accountId) return;
     const active = getActiveExternalAccount();
     const beforeTotal = externalAccountRuntime.account?.total ?? null;
-    const fallbackQuote = externalRouteCategory(route) === 'generate'
+    const isGenerate = externalRouteCategory(route) === 'generate';
+    const buttonPrice = isGenerate ? extractCapturedPrice(findGenerateButton()?.innerText || '') : null;
+    const fallbackQuote = isGenerate
       ? (externalAccountRuntime.quote?.amount ?? null)
       : null;
     const timestamp = now();
@@ -1230,13 +1233,22 @@
       void refreshExternalAccountSummary({ silent: true }).then((summary) => {
         const afterTotal = summary?.total ?? null;
         if (beforeTotal !== null && afterTotal !== null && beforeTotal >= afterTotal) {
+          const actualAnlas = beforeTotal - afterTotal;
           settleExternalUsageAnlas({
             accountId,
             logId: statRecord.logId,
             dayKey: statRecord.dayKey,
-            anlasDelta: beforeTotal - afterTotal,
+            anlasDelta: actualAnlas,
             estimated: false,
           });
+          if (isGenerate && buttonPrice !== null) {
+            externalAccountRuntime.lastMeasuredCost = {
+              accountId,
+              buttonPrice,
+              actualAnlas,
+              at: now(),
+            };
+          }
         } else if (fallbackQuote !== null) {
           settleExternalUsageAnlas({
             accountId,
@@ -1247,6 +1259,8 @@
           });
         }
         renderExternalAccountUi();
+        updateExternalGenerateButtonIndicator();
+        updateGenerateClickOverlay();
       });
     }
   }
@@ -1331,6 +1345,7 @@
       externalAccountRuntime.accountError = null;
       externalAccountRuntime.updatedAt = now();
       externalAccountRuntime.quote = null;
+      externalAccountRuntime.lastMeasuredCost = null;
       externalAccountRuntime.result = null;
       persistActiveExternalAccountId(target.id);
       if (externalAccountRuntime.lastQuoteBody) {
@@ -1357,6 +1372,7 @@
     externalAccountRuntime.accountError = null;
     externalAccountRuntime.updatedAt = null;
     externalAccountRuntime.quote = null;
+    externalAccountRuntime.lastMeasuredCost = null;
     externalAccountRuntime.result = null;
     persistActiveExternalAccountId(null);
     renderExternalAccountUi();
@@ -1400,12 +1416,23 @@
   }
 
   function externalButtonBadgeText(active, buttonText = '') {
+    const buttonPrice = extractCapturedPrice(buttonText);
     const quoteAmount = externalAccountRuntime.quote?.amount;
     if (quoteAmount !== null && quoteAmount !== undefined) {
-      const buttonPrice = extractCapturedPrice(buttonText);
       if (buttonPrice !== quoteAmount) {
         return `外部API · ${active.label} · 实耗 ${quoteAmount} Anlas`;
       }
+      return `外部API · ${active.label}`;
+    }
+    const measured = externalAccountRuntime.lastMeasuredCost;
+    if (
+      measured
+      && measured.accountId === active.id
+      && buttonPrice !== null
+      && measured.buttonPrice === buttonPrice
+      && measured.actualAnlas !== buttonPrice
+    ) {
+      return `外部API · ${active.label} · 实耗 ${measured.actualAnlas} Anlas`;
     }
     return `外部API · ${active.label}`;
   }
@@ -5281,12 +5308,12 @@
         .ext-kpi-value { margin-top: 2px; color: #fff; font-size: 15px; font-weight: 700; line-height: 1.2; }
         .ext-kpi-value.accent { color: #f5f3c2; }
         .ext-kpi-sub { margin-top: 2px; color: #8c94bf; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .ext-chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 4px; height: 66px; padding: 6px 4px 2px; background: #121633; border: 1px solid #2f365e; border-radius: 6px; }
-        .ext-chart-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 2px; height: 100%; min-width: 0; }
-        .ext-chart-val { color: #aeb5da; font-size: 9px; line-height: 1; }
+        .ext-chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 4px; min-height: 78px; padding: 8px 4px 6px; background: #121633; border: 1px solid #2f365e; border-radius: 6px; }
+        .ext-chart-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 3px; min-width: 0; }
+        .ext-chart-val { min-height: 10px; color: #aeb5da; font-size: 9px; line-height: 1; }
         .ext-chart-bar { width: 100%; max-width: 20px; min-height: 2px; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, #f5f3c2, #7077c2); transition: height .15s ease; }
         .ext-chart-bar.empty { background: #2c3359; }
-        .ext-chart-day { color: #858db9; font-size: 9px; line-height: 1; }
+        .ext-chart-day { color: #858db9; font-size: 9px; line-height: 1.1; }
         .ext-dash-accounts { display: flex; flex-direction: column; gap: 4px; }
         .ext-dash-accounts[hidden] { display: none; }
         .ext-dash-acc-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 7px; background: #121633; border-radius: 5px; font-size: 11px; }
