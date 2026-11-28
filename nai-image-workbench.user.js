@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI Image Workbench
 // @namespace    https://novelai.net/
-// @version      0.9.4
+// @version      0.9.5
 // @description  Queue generations, exchange NAI5 prompts, run prompt replacement batches, and track History saves in NovelAI Image Generation.
 // @author       Local
 // @match        https://novelai.net/*
@@ -19,7 +19,7 @@
   if (window.__NAI_IMAGE_WORKBENCH_LOADED__) return;
   window.__NAI_IMAGE_WORKBENCH_LOADED__ = true;
 
-  const SCRIPT_VERSION = '0.9.4';
+  const SCRIPT_VERSION = '0.9.5';
   const UPDATE_MANIFEST_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/version.json';
   const UPDATE_INSTALL_URL = 'https://raw.githubusercontent.com/KaerMorh/nai-image-workbench/main/nai-image-workbench.user.js';
   const UPDATE_META_KEY = 'update-check';
@@ -5045,10 +5045,14 @@
           actions.className = 'ext-account-actions';
           const useBtn = document.createElement('button');
           useBtn.type = 'button';
-          useBtn.className = isCurrent ? 'primary' : '';
-          useBtn.textContent = isCurrent ? '使用中' : '启用';
-          useBtn.disabled = externalAccountRuntime.busy || isCurrent;
-          useBtn.addEventListener('click', () => void activateExternalAccount(item.id));
+          useBtn.className = isCurrent ? 'ext-disable-highlight' : '';
+          useBtn.textContent = isCurrent ? '禁用 API' : '启用';
+          useBtn.title = isCurrent ? '点击禁用外部 API，恢复网页账号' : '点击在当前标签页启用此外部 API';
+          useBtn.disabled = externalAccountRuntime.busy;
+          useBtn.addEventListener('click', () => {
+            if (isCurrent) disableExternalAccount();
+            else void activateExternalAccount(item.id);
+          });
 
           const editBtn = document.createElement('button');
           editBtn.type = 'button';
@@ -5274,6 +5278,8 @@
         .ext-status-actions { display: flex; gap: 6px; margin-top: 8px; }
         .ext-status-actions[hidden] { display: none; }
         .ext-status-actions button { flex: 1 1 auto; }
+        .ext-disable-highlight { color: #fff; background: #d94862; border-color: #ff7d8e; box-shadow: 0 0 0 1px rgba(255,125,142,.25); }
+        .ext-disable-highlight:hover { color: #fff; background: #e85973; border-color: #ff99a7; }
         .ext-section-title { color: #c5cae9; font-size: 12px; font-weight: 600; }
         .ext-account-list { display: flex; flex-direction: column; gap: 6px; }
         .ext-empty { padding: 14px 10px; color: #989fca; text-align: center; border: 1px dashed #3a406a; border-radius: 8px; font-size: 12px; }
@@ -5490,7 +5496,7 @@
                 <div class="ext-error" hidden></div>
                 <div class="ext-status-actions" hidden>
                   <button class="ext-refresh" type="button">刷新额度</button>
-                  <button class="ext-disable danger" type="button">恢复网页账号</button>
+                  <button class="ext-disable ext-disable-highlight" type="button">禁用 API</button>
                 </div>
               </div>
               <div class="ext-dash" aria-label="外部 API 用量统计">
